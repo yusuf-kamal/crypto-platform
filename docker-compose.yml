@@ -11,6 +11,9 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     PYTHONPATH: /opt/airflow
     AIRFLOW_CONN_MINIO_S3: '{"conn_type":"aws","login":"${MINIO_ROOT_USER}","password":"${MINIO_ROOT_PASSWORD}","extra":{"endpoint_url":"http://minio:9000","region_name":"us-east-1"}}'
+    S3_ENDPOINT: http://minio:9000
+    MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+    MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs

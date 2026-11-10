@@ -18,6 +18,7 @@ QUARANTINE = "s3a://silver/_quarantine/aggtrades"
 
 def run(symbol: str, month: str) -> dict:
     started = time.time()
+    timings = {}
     key = f"binance/aggTrades/symbol={symbol}/{symbol}-aggTrades-{month}.zip"
     spark = get_spark(f"silver_{symbol}_{month}")
     s3 = boto3.client(
@@ -28,12 +29,19 @@ def run(symbol: str, month: str) -> dict:
         region_name="us-east-1",
     )
 
+    def lap(name, since):
+        now = time.time()
+        timings[name] = round(now - since, 1)
+        return now
+
     with tempfile.TemporaryDirectory() as tmp:
+        t = time.time()
         zip_path = os.path.join(tmp, "in.zip")
         s3.download_file("bronze", key, zip_path)
         with zipfile.ZipFile(zip_path) as z:
             csv_name = z.namelist()[0]
             z.extract(csv_name, tmp)
+        t = lap("download_unzip_s", t)
 
         raw = (
             spark.read.option("header", "false")
@@ -48,11 +56,13 @@ def run(symbol: str, month: str) -> dict:
             .persist(StorageLevel.MEMORY_AND_DISK)
         )
         total = tagged.count()
+        t = lap("read_parse_count_s", t)
 
         rejected = tagged.filter(F.col("reject_reason").isNotNull())
         n_rejected = rejected.count()
         rejected.write.mode("overwrite").partitionBy(
             "symbol", "file_month").parquet(QUARANTINE)
+        t = lap("quarantine_s", t)
 
         valid = (
             tagged.filter(F.col("reject_reason").isNull())
@@ -61,8 +71,10 @@ def run(symbol: str, month: str) -> dict:
             .persist(StorageLevel.MEMORY_AND_DISK)
         )
         n_valid = valid.count()
-        valid.write.mode("overwrite").partitionBy(
+        t = lap("dedupe_count_s", t)
+        valid.repartition(F.col("trade_date")).write.mode("overwrite").partitionBy(
             "symbol", "trade_date").parquet(SILVER)
+        t = lap("write_valid_s", t)
 
         tagged.unpersist()
         valid.unpersist()
@@ -73,6 +85,7 @@ def run(symbol: str, month: str) -> dict:
         "rows_duplicate": total - n_rejected - n_valid,
         "error_rate": round(n_rejected / total, 6) if total else 0,
         "seconds": round(time.time() - started, 1),
+        "timings": timings,
     }
     print(json.dumps(metrics))
     return metrics

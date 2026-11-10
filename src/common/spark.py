@@ -12,7 +12,7 @@ def get_spark(app_name: str) -> SparkSession:
     return (
         SparkSession.builder.appName(app_name)
         .master("local[4]")
-        .config("spark.driver.memory", "3g")
+        .config("spark.driver.memory", "6g")
         .config("spark.jars", JARS)
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
@@ -22,5 +22,6 @@ def get_spark(app_name: str) -> SparkSession:
         .config("spark.hadoop.fs.s3a.secret.key", os.environ["MINIO_ROOT_PASSWORD"])
         .config("spark.hadoop.fs.s3a.path.style.access", "true")
         .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
+        .config("spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version", "2")
         .getOrCreate()
     )

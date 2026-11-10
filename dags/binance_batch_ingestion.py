@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 
 import requests
 from airflow.sdk import dag, task
+from src.common.assets import BRONZE_AGGTRADES
+from src.common.config import MONTHS, SYMBOLS
 
 log = logging.getLogger("airflow.task")
 
@@ -14,8 +16,7 @@ BASE_URL = "https://data.binance.vision/data/spot/monthly/aggTrades"
 BUCKET = "bronze"
 CONN_ID = "minio_s3"
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
-MONTHS = ["2026-05", "2026-06", "2026-07", "2026-08", "2026-09", "2026-10"]
+
 
 
 @dag(
@@ -68,7 +69,14 @@ def binance_batch_ingestion():
         return {"symbol": symbol, "month": month, "status": "loaded",
                 "bytes": size, "seconds": seconds}
 
-    ingest.expand(symbol=SYMBOLS, month=MONTHS)
+    results = ingest.expand(symbol=SYMBOLS, month=MONTHS)
+
+    @task(outlets=[BRONZE_AGGTRADES])
+    def publish(results):
+        loaded = [r for r in results if r["status"] == "loaded"]
+        log.info("bronze ready: %d new files", len(loaded))
+
+    publish(results)
 
 
 binance_batch_ingestion()

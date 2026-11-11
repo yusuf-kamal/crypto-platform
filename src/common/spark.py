@@ -4,7 +4,8 @@ from pyspark.sql import SparkSession
 
 JARS = (
     "/opt/spark-jars/hadoop-aws-3.3.4.jar,"
-    "/opt/spark-jars/aws-java-sdk-bundle-1.12.262.jar"
+    "/opt/spark-jars/aws-java-sdk-bundle-1.12.262.jar,"
+    "/opt/spark-jars/mssql-jdbc-13.4.0.jre11.jar"
 )
 
 

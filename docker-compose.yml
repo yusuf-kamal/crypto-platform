@@ -114,7 +114,25 @@ services:
     command: triggerer
     depends_on:
       airflow-init:
-        condition: service_completed_successfully    
+        condition: service_completed_successfully 
+
+  jupyter:
+    <<: *airflow-common
+    container_name: jupyter
+    command:
+      - python
+      - -m
+      - jupyterlab
+      - --ip=0.0.0.0
+      - --port=8888
+      - --no-browser
+      - --ServerApp.token=
+    profiles: ["dev"]
+    ports:
+      - "127.0.0.1:8888:8888"
+    volumes:
+      - ./src:/opt/airflow/src
+      - ./notebooks:/opt/airflow/notebooks         
 volumes:
   minio_data:
   postgres_data:

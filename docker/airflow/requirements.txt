@@ -2,3 +2,4 @@ apache-airflow-providers-amazon
 apache-airflow-providers-postgres
 requests
 pyspark==3.5.1
+jupyterlab

@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 from airflow.sdk import dag, task
 
-from src.common.assets import BRONZE_AGGTRADES
+from src.common.assets import BRONZE_AGGTRADES, SILVER_AGGTRADES
 from src.common.config import MONTHS, SYMBOLS
 
 log = logging.getLogger("airflow.task")
@@ -46,7 +46,14 @@ def binance_silver():
         s3.put_object(Bucket="silver", Key=manifest, Body=json.dumps(metrics))
         return {**metrics, "status": "processed"}
 
-    transform.expand(symbol=SYMBOLS, month=MONTHS)
+    results = transform.expand(symbol=SYMBOLS, month=MONTHS)
+
+    @task(outlets=[SILVER_AGGTRADES])
+    def publish(results):
+        done = [r for r in results if r["status"] == "processed"]
+        log.info("silver ready: %d files processed", len(done))
+
+    publish(results)
 
 
 binance_silver()

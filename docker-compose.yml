@@ -137,7 +137,23 @@ services:
       - "127.0.0.1:8888:8888"
     volumes:
       - ./src:/opt/airflow/src
-      - ./notebooks:/opt/airflow/notebooks         
+      - ./notebooks:/opt/airflow/notebooks 
+
+  dbt:
+    build: ./docker/dbt
+    image: crypto-dbt:1.0
+    profiles: ["tools"]
+    entrypoint: ["dbt"]
+    working_dir: /app/dbt
+    environment:
+      DBT_PROFILES_DIR: /app/dbt
+      MSSQL_HOST: ${MSSQL_HOST}
+      MSSQL_PORT: ${MSSQL_PORT}
+      MSSQL_DB: ${MSSQL_DB}
+      MSSQL_USER: ${MSSQL_USER}
+      MSSQL_PASSWORD: ${MSSQL_PASSWORD}
+    volumes:
+      - ./dbt:/app/dbt           
 volumes:
   minio_data:
   postgres_data:

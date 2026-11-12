@@ -1,0 +1,12 @@
+version: 2
+
+sources:
+  - name: staging
+    schema: staging
+    tables:
+      - name: candles_1m
+  - name: gold_seed
+    schema: gold
+    tables:
+      - name: dim_date
+      - name: dim_time

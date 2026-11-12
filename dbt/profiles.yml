@@ -1,0 +1,15 @@
+crypto_dwh:
+  target: dev
+  outputs:
+    dev:
+      type: sqlserver
+      driver: "ODBC Driver 18 for SQL Server"
+      server: "{{ env_var('MSSQL_HOST') }}"
+      port: "{{ env_var('MSSQL_PORT') | as_number }}"
+      database: "{{ env_var('MSSQL_DB') }}"
+      schema: gold
+      user: "{{ env_var('MSSQL_USER') }}"
+      password: "{{ env_var('MSSQL_PASSWORD') }}"
+      encrypt: true
+      trust_cert: true
+      threads: 1

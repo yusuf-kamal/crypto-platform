@@ -1,0 +1,6 @@
+name: crypto_dwh
+version: "1.0.0"
+config-version: 2
+profile: crypto_dwh
+model-paths: ["models"]
+test-paths: ["tests"]

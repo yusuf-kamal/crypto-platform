@@ -4,6 +4,10 @@ __pycache__/
 .venv/
 data/
 *.log
+# Airflow writes task logs into this bind mount on the first run. `*.log`
+# alone does not cover everything that lands here (the dag processor and the
+# scheduler write other files too), so the whole folder stays out.
+logs/
 dbt/target/
 dbt/logs/
 dbt/dbt_packages/

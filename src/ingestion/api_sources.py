@@ -24,14 +24,30 @@ RETRY_STATUS = (429, 500, 502, 503, 504)
 
 def fetch_json(url: str, params: dict | None = None,
                retries: int = 3, backoff: float = 5.0) -> dict:
+    """GET and parse JSON, retrying only what retrying can fix.
+
+    A 429 or a 5xx is worth another attempt. A 404 or a 401 is not, and
+    retrying one only delays the real error by the whole backoff budget --
+    which, with the defaults, is 15 seconds of pretending the coin id might
+    start existing. The two cases are kept apart instead of both arriving as
+    a RequestException.
+    """
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
             resp = requests.get(url, params=params, timeout=60)
+
             if resp.status_code in RETRY_STATUS:
                 raise requests.HTTPError(
                     f"{resp.status_code} from {url}", response=resp)
-            resp.raise_for_status()
+
+            if resp.status_code >= 400:
+                # Permanent for this call: a wrong coin id, a removed
+                # endpoint, a blocked client. Raised outside the retry
+                # handler so it leaves immediately.
+                raise RuntimeError(
+                    f"{resp.status_code} from {url} - not retryable")
+
             return resp.json()
         except (requests.RequestException, ValueError) as exc:
             last_error = exc

@@ -34,7 +34,7 @@ The volatility view is also where the two sources meet: the candle fact gives th
 | Data lake with Bronze / Silver / Gold buckets (S3-compatible) | Done |
 | Silver: Spark typing, cleaning, de-duplication, quarantine | Done |
 | Warehouse: SQL Server star schema, dbt incremental models | Done |
-| Data quality: 62 Python unit tests, 39 dbt tests | Done. The 62 Python tests pass in CI; of the dbt tests, 13 are verified against real data and the remaining 26 (API facts, reporting views, ops) have been parsed but not yet run |
+| Data quality: 90 Python unit tests, 39 dbt tests | Done. The Python tests pass in CI; of the dbt tests, 13 are verified against real data and the remaining 26 (API facts, reporting views, ops) have been parsed but not yet run |
 | Orchestration: 7 Airflow DAGs, chained with Assets where they produce data | Done |
 | Airflow task that runs dbt (run, test, docs generate) | Done |
 | Gold recomputes only newly processed Silver files | Done |

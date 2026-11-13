@@ -1,8 +1,10 @@
 # Crypto Market Data Platform
 
+[![CI](https://github.com/yusuf-kamal/crypto-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/yusuf-kamal/crypto-platform/actions/workflows/ci.yml)
+
 An end-to-end data engineering project that ingests Binance historical trade data, processes it through a Bronze / Silver / Gold (medallion) lake, and serves 1-minute candles from a SQL Server star schema. Built as the Data Pill Data Engineering graduation project.
 
-> **Project status:** the batch path (ingestion → Silver → Gold → dbt tests) is working end to end. Streaming, additional sources, the dashboard, alerting and CI are **not built yet**; see [Status](#status) for an honest checklist.
+> **Project status:** the batch path (ingestion → Silver → Gold → dbt) runs end to end on real data. Both source types, the streaming path, orchestrated dbt, observability, Delta Lake, the reporting views and CI are built; the streaming path and the dbt tests on the newer models have not yet been run against live data, and the dashboard is still open. See [Status](#2-status) for the per-area checklist, which says what is verified and what is only written.
 
 ---
 

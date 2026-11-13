@@ -122,3 +122,74 @@ models:
         tests: [not_null]
       - name: loaded_at
         description: UTC timestamp of the dbt run that wrote the row.
+
+  # --- Reporting layer -------------------------------------------------------
+  # Views over the star schema, one per business question from section 1 of
+  # the README. A BI tool connects to these instead of writing its own joins,
+  # so the definition of "volume per hour" or "buy share" lives in the
+  # repository and is tested, not inside a dashboard file.
+
+  - name: vw_symbol_hourly_activity
+    description: >
+      Business question 1. Volume, turnover and trade count per symbol, day
+      and hour of day (UTC), with the hour taken from dim_time so that "at
+      which hours" is a plain group-by.
+    columns:
+      - name: symbol
+        tests: [not_null]
+      - name: full_date
+        tests: [not_null]
+      - name: hour_utc
+        description: Hour of day in UTC, 0-23.
+        tests: [not_null]
+      - name: minutes_traded
+        description: >
+          How many of the hour's 60 minutes actually had trades. A low value
+          marks a thin hour, and keeps an average from looking busier than
+          the market was.
+
+  - name: vw_symbol_daily_volatility
+    description: >
+      Business question 2, and the one place where both sources meet. Daily
+      open/high/low/close and range per symbol from the candle fact, joined
+      to that day's market cap and Fear & Greed value from the API facts.
+      Both joins are LEFT: the batch scope and the API lookback do not cover
+      exactly the same days.
+    columns:
+      - name: symbol
+        tests: [not_null]
+      - name: full_date
+        tests: [not_null]
+      - name: day_open
+        description: Open of the day's first traded minute, by time_key.
+      - name: day_close
+        description: Close of the day's last traded minute, by time_key.
+      - name: day_range_pct
+        description: (day_high - day_low) / day_low, as a percentage.
+      - name: day_change_pct
+        description: (day_close - day_open) / day_open, as a percentage.
+      - name: max_minute_range
+        description: Largest high-low spread inside a single minute that day.
+      - name: avg_minute_range
+        description: Mean high-low spread per traded minute.
+      - name: market_cap_usd
+        description: From CoinGecko. Null on days the API lookback does not cover.
+      - name: fng_value
+        description: Market-wide Fear & Greed value for the day. Null if not covered.
+
+  - name: vw_symbol_buy_sell_balance
+    description: >
+      Business question 3. Buy versus sell volume per symbol and day, where
+      "buy" means the buyer was the aggressor. buy_share above 0.5 is net
+      buying pressure.
+    columns:
+      - name: symbol
+        tests: [not_null]
+      - name: full_date
+        tests: [not_null]
+      - name: net_flow
+        description: buy_volume - sell_volume. Negative means net selling.
+      - name: buy_share
+        description: >
+          buy_volume / volume, between 0 and 1. Null on a day with no volume
+          at all, rather than a division error.

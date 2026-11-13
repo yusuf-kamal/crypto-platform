@@ -10,11 +10,15 @@ An end-to-end data engineering project that ingests Binance historical trade dat
 
 Raw Binance trade files are huge (tens of millions of rows per symbol per month) and unsuitable for direct analytics. This project turns them into a compact, tested, analysis-ready warehouse.
 
-**Business questions the warehouse is designed to answer** (the dashboard that will present them is still planned):
+**Business questions the warehouse is designed to answer.** Each one has a tested view in the gold schema, so a BI tool connects to that instead of writing its own joins -- the definition of "volume per hour" or "buy share" lives in this repository and is tested, not inside a dashboard file.
 
-1. Which symbols have the highest trading volume, and at which hours of the day?
-2. How volatile is each symbol over time (high-low range per candle, per hour, per day)?
-3. How does buy volume compare with sell volume for each symbol?
+| Question | View |
+|---|---|
+| 1. Which symbols have the highest trading volume, and at which hours of the day? | `gold.vw_symbol_hourly_activity` |
+| 2. How volatile is each symbol over time (high-low range per candle, per hour, per day)? | `gold.vw_symbol_daily_volatility` |
+| 3. How does buy volume compare with sell volume for each symbol? | `gold.vw_symbol_buy_sell_balance` |
+
+The volatility view is also where the two sources meet: the candle fact gives the intraday movement, the API facts give that day's market cap and Fear & Greed value next to it.
 
 ---
 
@@ -28,7 +32,7 @@ Raw Binance trade files are huge (tens of millions of rows per symbol per month)
 | Data lake with Bronze / Silver / Gold buckets (S3-compatible) | Done |
 | Silver: Spark typing, cleaning, de-duplication, quarantine | Done |
 | Warehouse: SQL Server star schema, dbt incremental models | Done |
-| Data quality: 54 Python unit tests, 24 dbt tests | Done (the 13 candle-path dbt tests are verified; the 11 API tests have not been run yet) |
+| Data quality: 54 Python unit tests, 33 dbt tests | Done (13 of the dbt tests are verified against real data; the 20 on the API facts and the reporting views have not been run yet) |
 | Orchestration: 6 Airflow DAGs chained with Assets | Done |
 | Airflow task that runs dbt (run, test, docs generate) | Done |
 | Gold recomputes only newly processed Silver files | Done |
@@ -38,7 +42,8 @@ Raw Binance trade files are huge (tens of millions of rows per symbol per month)
 | Performance tuning with before/after measurements | Done (Silver write path) |
 | GitHub Actions CI: ruff, unit tests, DAG import check, `docker compose config`, `dbt parse` | Done |
 | Warehouse keys and checks survive a dbt `--full-refresh` | Done |
-| Power BI dashboard on the Gold layer | Planned |
+| Reporting views, one per business question, with their own grain and range tests | Done |
+| Power BI dashboard on top of those views | Planned |
 | Delta Lake or Iceberg, CDC, Terraform | Not started |
 
 ---
@@ -233,6 +238,8 @@ docker compose --profile dev up -d jupyter    # http://localhost:8888
 docker compose exec airflow-scheduler python -m pytest tests -q
 ```
 
+**Connecting a BI tool.** Point it at `localhost,14330`, database `CryptoDWH`, login `crypto_app`, and use the three `gold.vw_*` views rather than the fact tables: they already carry the business logic for the questions in section 1, and they are covered by dbt tests.
+
 The compose `dbt` service bind-mounts `./dbt`, so `docs generate` through it writes `dbt/target/` on the host, which `dbt docs serve` can then open. The Airflow DAG runs the same image with the project baked in and keeps its artefacts in the `dbt_target` volume.
 
 ---
@@ -267,7 +274,7 @@ src/
     binance_ws_producer.py     Binance WebSocket -> Kafka (long-running)
     trades_stream_job.py       Structured Streaming: Kafka -> Silver
 dbt/
-  models/                      dim_symbol, 3 fact models, 24 tests, descriptions
+  models/                      dim_symbol, 3 facts, 3 reporting views, descriptions
   macros/                      key / foreign key / check constraints as hooks
   tests/                       singular data tests
 sql/                           DDL, dimension seeds, login, ops table
@@ -316,6 +323,7 @@ Compose services, always on: SQL Server + its init job, object storage + bucket 
 | **SQL Server inside Compose** | `docker compose up -d` becomes the entire setup, and `mssql-init` replaces a page of manual SSMS steps | A host installation (what the project started with) |
 | **Gold tracks its own processed pairs in object storage** | The Silver manifests already say what exists; a small JSON of what Gold consumed turns that into a watermark without adding a database | A column in SQL Server, Airflow XCom, reprocessing everything |
 | **Metrics written by the jobs, not by Airflow** | The job is the only place that knows row counts and per-stage timings; Airflow only knows that a task ended | Parsing task logs, a separate collector |
+| **Reporting views, not materialised tables** | The fact is 1.1 M rows and a BI tool aggregates that in well under a second. A materialised copy would be one more object that can go stale, and the view definitions are the tested business logic | Materialised aggregate tables, logic inside the dashboard |
 | **One owner per table: dbt owns the facts and dim_symbol, SQL owns the seeded dimensions** | A table created by a DDL script and then materialized by dbt loses its constraints on the first `--full-refresh`, silently. Keys and checks are dbt hooks now, so they are restored after every build | DDL-only tables with dbt as a view layer, dbt contracts |
 
 ---
@@ -331,11 +339,12 @@ Compose services, always on: SQL Server + its init job, object storage + bucket 
 - De-duplication on `agg_trade_id`.
 - A per-file manifest (row counts, rejected count, error rate, per-stage timings) is written after each successful run.
 
-### Gold (dbt): 24 tests
+### Gold (dbt): 33 tests
 
 - `unique` and `not_null` on keys, `not_null` on `trade_count`.
 - `relationships` (referential integrity) from the fact to `dim_symbol`, `dim_date` and `dim_time`.
 - Custom tests: grain uniqueness `(date_key, time_key, symbol_key)` and price/volume consistency (`low <= open, close <= high`, volume >= 0, trade_count > 0), the Fear & Greed 0-100 range, and `assert_api_facts_cover_staging`.
+- **The reporting views are tested too**, because a wrong `group by` there would double every measure in the dashboard with no other symptom: grain uniqueness on the hourly view, and range invariants (`buy_share` inside [0, 1], `day_high >= day_low`, never more than 60 minutes in an hour).
 
 ### Warehouse constraints
 

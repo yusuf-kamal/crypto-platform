@@ -47,7 +47,8 @@ The volatility view is also where the two sources meet: the candle fact gives th
 | GitHub Actions CI: ruff, unit tests, DAG import check, `docker compose config`, `dbt parse` | Done |
 | Warehouse keys and checks survive a dbt `--full-refresh` | Done |
 | Reporting views, one per business question, with their own grain and range tests | Done |
-| Power BI dashboard on top of those views | Planned |
+| Power BI: model, measures and layout specified in `powerbi/` | Done |
+| Power BI: the .pbix itself, assembled in Desktop | Planned |
 | Delta Lake on the Silver layer (atomic writes, `replaceWhere`, time travel) | Code complete, not yet run |
 | Iceberg, CDC, Terraform | Not started |
 
@@ -319,6 +320,7 @@ docker/
   dbt/                         dbt image with the project baked in (ODBC)
   mssql/init.sh                applies sql/ once SQL Server is up
   streaming/                   small image for the WebSocket producer
+powerbi/                       model, DAX measures and the dashboard design
 scripts/prefetch.sh            pulls images and builds, with retries, before the first start
 tests/                         PySpark + plain Python unit tests
 notebooks/                     exploration (outputs kept: they are the row counts quoted in section 4)

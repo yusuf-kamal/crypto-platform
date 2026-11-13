@@ -96,3 +96,65 @@ def month_bounds(month: str) -> tuple[str, str]:
     last_day = monthrange(year, mon)[1]
     return (date(year, mon, 1).isoformat(),
             date(year, mon, last_day).isoformat())
+
+
+# --- Maintenance -----------------------------------------------------------
+# Delta keeps superseded files around so that time travel works. Nothing
+# reclaims them on its own, so disk use grows with every re-run and small
+# files accumulate. These two statements are what the maintenance DAG runs.
+
+SILVER_TABLES = (
+    SILVER_AGGTRADES,
+    SILVER_COIN_MARKET,
+    SILVER_FEAR_GREED,
+    SILVER_STREAM_CANDLES,
+    QUARANTINE_AGGTRADES,
+    QUARANTINE_COIN_MARKET,
+    QUARANTINE_FEAR_GREED,
+)
+
+# One week. Shorter than this and a `VACUUM` could delete files a long-running
+# reader still needs; Delta refuses anything under 168 hours by default for
+# exactly that reason.
+VACUUM_RETAIN_HOURS = 168
+
+
+def delta_relation(path: str) -> str:
+    """`delta.`s3a://...`` -- how Spark SQL names a Delta table by path."""
+    return f"delta.`{path}`"
+
+
+def table_exists(spark, path: str) -> bool:
+    """True if the path holds a readable table of the configured format.
+
+    Maintenance must not fail because the streaming path has never run, or
+    because a quarantine prefix is still empty.
+    """
+    try:
+        read_lake(spark, path).limit(0).count()
+        return True
+    except Exception:                                         # noqa: BLE001
+        return False
+
+
+def optimize(spark, path: str) -> None:
+    """Compact the many small files a partitioned write leaves behind."""
+    spark.sql(f"OPTIMIZE {delta_relation(path)}")
+
+
+def vacuum(spark, path: str, retain_hours: int = VACUUM_RETAIN_HOURS) -> None:
+    """Delete files that no version inside the retention window references."""
+    spark.sql(
+        f"VACUUM {delta_relation(path)} RETAIN {int(retain_hours)} HOURS")
+
+
+def table_detail(spark, path: str) -> dict:
+    """Size, file count and current version, for the maintenance metrics."""
+    row = spark.sql(f"DESCRIBE DETAIL {delta_relation(path)}").collect()[0]
+    history = spark.sql(
+        f"DESCRIBE HISTORY {delta_relation(path)} LIMIT 1").collect()
+    return {
+        "num_files": row["numFiles"],
+        "size_bytes": row["sizeInBytes"],
+        "version": history[0]["version"] if history else None,
+    }

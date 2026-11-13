@@ -26,3 +26,14 @@ sources:
         description: One row per calendar day, 2025-2027.
       - name: dim_time
         description: One row per minute of the day. A constant 1,440 rows.
+
+  - name: ops
+    schema: ops
+    description: >
+      Operational metadata, written by the jobs themselves rather than
+      derived from source data.
+    tables:
+      - name: pipeline_runs
+        description: >
+          One row per entity a job processed: layer, entity, status, row
+          counts, duration and the job's own metrics as JSON.

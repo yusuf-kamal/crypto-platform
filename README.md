@@ -32,11 +32,13 @@ The volatility view is also where the two sources meet: the candle fact gives th
 | Data lake with Bronze / Silver / Gold buckets (S3-compatible) | Done |
 | Silver: Spark typing, cleaning, de-duplication, quarantine | Done |
 | Warehouse: SQL Server star schema, dbt incremental models | Done |
-| Data quality: 62 Python unit tests, 33 dbt tests | Done (13 of the dbt tests are verified against real data; the 20 on the API facts and the reporting views have not been run yet) |
-| Orchestration: 6 Airflow DAGs chained with Assets | Done |
+| Data quality: 62 Python unit tests, 39 dbt tests | Done (13 of the dbt tests are verified against real data; the 20 on the API facts and the reporting views have not been run yet) |
+| Orchestration: 7 Airflow DAGs, chained with Assets where they produce data | Done |
 | Airflow task that runs dbt (run, test, docs generate) | Done |
 | Gold recomputes only newly processed Silver files | Done |
 | Structured logging, run-metrics table, failure alerts | Done (webhook alerting is opt-in through ALERT_WEBHOOK_URL) |
+| `ops.vw_pipeline_health`: last run, history and a health verdict per entity | Done |
+| Weekly Delta maintenance (`OPTIMIZE` + `VACUUM`) | Done |
 | Lineage / data catalog (`dbt docs generate`) | Done |
 | Run the whole platform with `docker compose up -d`, SQL Server included | Done |
 | Performance tuning with before/after measurements | Done (Silver write path) |
@@ -241,6 +243,16 @@ docker compose --profile dev up -d jupyter    # http://localhost:8888
 docker compose exec airflow-scheduler python -m pytest tests -q
 ```
 
+**Checking on the pipeline.**
+
+```sql
+SELECT layer, entity, health, last_status, hours_since_last_run,
+       last_rows_rejected, last_seconds
+FROM   ops.vw_pipeline_health
+WHERE  health <> 'ok'
+ORDER  BY layer, entity;
+```
+
 **Connecting a BI tool.** Point it at `localhost,14330`, database `CryptoDWH`, login `crypto_app`, and use the three `gold.vw_*` views rather than the fact tables: they already carry the business logic for the questions in section 1, and they are covered by dbt tests.
 
 The compose `dbt` service bind-mounts `./dbt`, so `docs generate` through it writes `dbt/target/` on the host, which `dbt docs serve` can then open. The Airflow DAG runs the same image with the project baked in and keeps its artefacts in the `dbt_target` volume.
@@ -257,12 +269,13 @@ dags/
   api_daily_ingestion.py       Bronze: CoinGecko + Fear & Greed JSON, one file per day
   api_daily_warehouse.py       Silver + staging for the API source
   dbt_build.py                 dbt run / test / docs generate, in the dbt container
+  lake_maintenance.py          weekly OPTIMIZE + VACUUM on the Delta tables
 src/
   common/
     config.py                  symbols, months, coin ids, lookback
     assets.py                  the Airflow Assets that chain the DAGs
     spark.py                   Spark session factory (S3A, JDBC, Kafka, Delta)
-    lake.py                    lake paths, format, and replaceWhere predicates
+    lake.py                    lake paths, format, replaceWhere, maintenance
     observability.py           structured logging, run metrics, failure alerts
   ingestion/
     api_sources.py             HTTP access to both public REST APIs
@@ -273,12 +286,14 @@ src/
     gold_job.py                reads Silver, writes staging via JDBC, incremental
     api_daily.py               API JSON -> daily rows + quality gate (pure)
     api_job.py                 API Silver + staging
+    maintenance_job.py         Delta OPTIMIZE / VACUUM + reclaimed-bytes metrics
   streaming/
     trade_events.py            Kafka JSON -> typed trades -> candles (pure)
     binance_ws_producer.py     Binance WebSocket -> Kafka (long-running)
     trades_stream_job.py       Structured Streaming: Kafka -> Silver
 dbt/
-  models/                      dim_symbol, 3 facts, 3 reporting views, descriptions
+  models/                      dim_symbol, 3 facts, 3 reporting views, ops health view
+  macros/                      constraints as hooks, literal custom schemas
   macros/                      key / foreign key / check constraints as hooks
   tests/                       singular data tests
 sql/                           DDL, dimension seeds, login, ops table
@@ -328,6 +343,8 @@ Compose services, always on: SQL Server + its init job, object storage + bucket 
 | **dbt orchestrated through the Docker socket** | dbt needs Python 3.11 and Airflow runs 3.13, so it cannot be imported. Starting its image keeps that split and still puts dbt under orchestration | dbt inside the Airflow image, Cosmos, a bash `docker exec` |
 | **SQL Server inside Compose** | `docker compose up -d` becomes the entire setup, and `mssql-init` replaces a page of manual SSMS steps | A host installation (what the project started with) |
 | **Gold tracks its own processed pairs in object storage** | The Silver manifests already say what exists; a small JSON of what Gold consumed turns that into a watermark without adding a database | A column in SQL Server, Airflow XCom, reprocessing everything |
+| **The metrics table is read back as a view, not a dashboard** | A table nobody queries is not observability. One view with a single `health` column is something an alert query, a tile or a human can use, and it lives in the repository under test | A monitoring tool, a Grafana datasource, reading task logs |
+| **Maintenance is time-based, not Asset-driven** | `OPTIMIZE` and `VACUUM` are upkeep, not production of data: they must run whether or not a batch arrived that week | Running them at the end of the Silver DAG |
 | **Metrics written by the jobs, not by Airflow** | The job is the only place that knows row counts and per-stage timings; Airflow only knows that a task ended | Parsing task logs, a separate collector |
 | **Reporting views, not materialised tables** | The fact is 1.1 M rows and a BI tool aggregates that in well under a second. A materialised copy would be one more object that can go stale, and the view definitions are the tested business logic | Materialised aggregate tables, logic inside the dashboard |
 | **One owner per table: dbt owns the facts and dim_symbol, SQL owns the seeded dimensions** | A table created by a DDL script and then materialized by dbt loses its constraints on the first `--full-refresh`, silently. Keys and checks are dbt hooks now, so they are restored after every build | DDL-only tables with dbt as a view layer, dbt contracts |
@@ -395,6 +412,7 @@ Two details make this work on a repeat run. The `not null` step is guarded by `s
 - Every job emits one structured JSON line per event through `json_log()`, with a fixed envelope (`ts`, `event`, then the fields).
 - Each job also appends a row per processed entity to `ops.pipeline_runs` (layer, entity, status, row counts, seconds, the job's own metrics as JSON). A metrics write that fails is logged and swallowed: observability must never fail the pipeline.
 - Every DAG carries an `on_failure_callback` that logs the failure as a structured event and, if `ALERT_WEBHOOK_URL` is set, posts a short message to it. A webhook that cannot be reached must not mask the real error, so that failure is logged too.
+- `ops.vw_pipeline_health` reads that table back: one row per (layer, entity) with its last run, its own history for comparison, and a `health` verdict -- `ok`, `quality` (the last run rejected more than 1% of its input), `stale` (nothing for over 48 hours) or `attention` (the last run did not end in `processed`). Checked in that order, so a failure is never hidden behind a reject rate.
 
 ### Re-running safely
 
@@ -419,7 +437,7 @@ Two details make this work on a repeat run. The `not null` step is guarded by `s
 - Airflow runs without a login and Jupyter without a token; both are bound for local use only.
 - To use a SQL Server on the host instead of the container, set `MSSQL_HOST=host.docker.internal` and its port in `.env`, stop the `mssql` service, and apply `sql/` by hand in SSMS (in the order listed in step 2). The firewall rule is then also needed: `New-NetFirewallRule -DisplayName "SQL Server 14330" -Direction Inbound -Protocol TCP -LocalPort 14330 -Action Allow`.
 - Committer algorithm v2 (section 10) only applies on the `LAKE_FORMAT=parquet` fallback; Delta commits through its own transaction log and never leaves a partial write visible. The measurements in section 10 were taken on the parquet path.
-- Nothing runs `OPTIMIZE` or `VACUUM` on the Delta tables yet, so old file versions accumulate. Time travel works; disk use grows.
+- `VACUUM` keeps 168 hours of history, which is Delta's own floor: below that it refuses, because a long-running reader could still need those files. So a week of superseded versions is always on disk, and time travel reaches back exactly that far.
 - Performance numbers below are single runs on one laptop, not averaged benchmarks, and none of them cover the streaming path.
 
 ---

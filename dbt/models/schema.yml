@@ -193,3 +193,36 @@ models:
         description: >
           buy_volume / volume, between 0 and 1. Null on a day with no volume
           at all, rather than a division error.
+
+  # --- Operations ------------------------------------------------------------
+
+  - name: vw_pipeline_health
+    description: >
+      One row per (layer, entity) in ops.pipeline_runs: how its last run
+      went, next to its own history. `health` collapses that into a single
+      value an alert query or a dashboard tile can filter on.
+    columns:
+      - name: layer
+        description: bronze / silver / gold / api / maintenance.
+        tests: [not_null]
+      - name: entity
+        description: "What was processed, e.g. BTCUSDT|2026-06 or a lake path."
+        tests: [not_null]
+      - name: last_status
+        tests: [not_null]
+      - name: hours_since_last_run
+        description: Age of the most recent run, in whole hours UTC.
+      - name: last_error_rate
+        description: >
+          rows_rejected / rows_in for the last run. Null where the job does
+          not count input rows (the API and Gold jobs do not).
+      - name: health
+        description: >
+          `ok`, `quality` (last run rejected more than 1% of its input),
+          `stale` (nothing for over 48 hours) or `attention` (the last run
+          did not end in `processed`). Checked in that order, so a failure
+          is never hidden behind a reject rate.
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['ok', 'quality', 'stale', 'attention']

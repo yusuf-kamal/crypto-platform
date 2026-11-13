@@ -36,5 +36,7 @@ CREATE INDEX IX_pipeline_runs_layer_time
     ON ops.pipeline_runs (layer, recorded_at DESC);
 GO
 
-GRANT SELECT, INSERT ON SCHEMA::ops TO crypto_app;
+-- SELECT + INSERT for the jobs writing metrics, ALTER so that dbt can create
+-- and replace the health view in this schema.
+GRANT SELECT, INSERT, ALTER ON SCHEMA::ops TO crypto_app;
 GO

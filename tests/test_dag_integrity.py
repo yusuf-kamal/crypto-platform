@@ -25,6 +25,7 @@ EXPECTED_DAG_IDS = {
     "api_daily_ingestion",
     "api_daily_warehouse",
     "dbt_build",
+    "lake_maintenance",
 }
 
 

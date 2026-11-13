@@ -22,7 +22,7 @@ jobs:
       - run: ruff check .
 
   test:
-    name: PySpark unit tests
+    name: Python unit tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,8 +43,73 @@ jobs:
 
       - run: pip install pyspark==3.5.1 pytest==8.3.4
 
-      # The tests import src.transform.*, so the repo root must be importable.
+      # The tests import src.*, so the repo root must be importable.
       - run: pytest tests -q
         env:
           PYTHONPATH: ${{ github.workspace }}
           SPARK_LOCAL_IP: 127.0.0.1
+
+  dags:
+    name: Airflow DAG import
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # A DAG that raises at parse time is invisible in the UI apart from an
+      # import error, which is easy to miss. This job fails instead. The
+      # constraints file is the only safe way to install Airflow with pip.
+      - name: Install Airflow and the providers the DAGs import
+        run: |
+          pip install "apache-airflow==3.3.2" \
+            apache-airflow-providers-amazon \
+            apache-airflow-providers-docker \
+            pytest==8.3.4 \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-3.3.2/constraints-3.12.txt"
+
+      - run: pytest tests/test_dag_integrity.py -q
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          AIRFLOW_HOME: ${{ runner.temp }}/airflow
+          AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+          AIRFLOW__CORE__DAGS_FOLDER: ${{ github.workspace }}/dags
+
+  compose:
+    name: Compose and dbt project
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `docker compose config` resolves anchors, profiles and every
+      # ${VARIABLE}, so it catches a typo in docker-compose.yml without
+      # pulling a single image. The values are throwaway.
+      - name: Validate docker-compose.yml
+        run: |
+          cp .env.example .env
+          sed -i 's/^\([A-Z_]*\)=$/\1=ci-placeholder/' .env
+          docker compose config --quiet
+          docker compose --profile streaming --profile tools --profile dev config --quiet
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # `dbt parse` compiles every model, test and macro without connecting to
+      # the warehouse, which is what validates the Jinja in the constraint
+      # hooks.
+      - name: Parse the dbt project
+        working-directory: dbt
+        run: |
+          pip install dbt-core==1.12.6 dbt-sqlserver==1.12.1
+          dbt parse
+        env:
+          DBT_PROFILES_DIR: ${{ github.workspace }}/dbt
+          MSSQL_HOST: localhost
+          MSSQL_PORT: "1433"
+          MSSQL_DB: CryptoDWH
+          MSSQL_USER: ci
+          MSSQL_PASSWORD: ci-placeholder

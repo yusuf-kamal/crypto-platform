@@ -3,7 +3,13 @@
 -- separate fact instead of a column on fact_coin_market_daily.
 {{ config(
     materialized='incremental',
-    unique_key=['date_key']
+    unique_key=['date_key'],
+    post_hook=[
+        "{{ not_null_columns([{'name': 'date_key', 'type': 'int'}]) }}",
+        "{{ add_primary_key('PK_fact_fear_greed_daily', 'date_key') }}",
+        "{{ add_foreign_key('FK_fear_greed_date', 'date_key', 'gold.dim_date(date_key)') }}",
+        "{{ add_check('CK_fear_greed_range', 'fng_value between 0 and 100') }}"
+    ]
 ) }}
 
 select

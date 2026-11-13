@@ -28,7 +28,7 @@ Raw Binance trade files are huge (tens of millions of rows per symbol per month)
 | Data lake with Bronze / Silver / Gold buckets (S3-compatible) | Done |
 | Silver: Spark typing, cleaning, de-duplication, quarantine | Done |
 | Warehouse: SQL Server star schema, dbt incremental models | Done |
-| Data quality: 50 Python unit tests, 24 dbt tests | Done (the 13 candle-path dbt tests are verified; the 11 API tests have not been run yet) |
+| Data quality: 54 Python unit tests, 24 dbt tests | Done (the 13 candle-path dbt tests are verified; the 11 API tests have not been run yet) |
 | Orchestration: 6 Airflow DAGs chained with Assets | Done |
 | Airflow task that runs dbt (run, test, docs generate) | Done |
 | Gold recomputes only newly processed Silver files | Done |
@@ -36,7 +36,8 @@ Raw Binance trade files are huge (tens of millions of rows per symbol per month)
 | Lineage / data catalog (`dbt docs generate`) | Done |
 | Run the whole platform with `docker compose up -d`, SQL Server included | Done |
 | Performance tuning with before/after measurements | Done (Silver write path) |
-| GitHub Actions CI (ruff lint + Python unit tests on every push) | Done |
+| GitHub Actions CI: ruff, unit tests, DAG import check, `docker compose config`, `dbt parse` | Done |
+| Warehouse keys and checks survive a dbt `--full-refresh` | Done |
 | Power BI dashboard on the Gold layer | Planned |
 | Delta Lake or Iceberg, CDC, Terraform | Not started |
 
@@ -265,7 +266,10 @@ src/
     trade_events.py            Kafka JSON -> typed trades -> candles (pure)
     binance_ws_producer.py     Binance WebSocket -> Kafka (long-running)
     trades_stream_job.py       Structured Streaming: Kafka -> Silver
-dbt/                           dim_symbol, 3 fact models, 24 tests, descriptions
+dbt/
+  models/                      dim_symbol, 3 fact models, 24 tests, descriptions
+  macros/                      key / foreign key / check constraints as hooks
+  tests/                       singular data tests
 sql/                           DDL, dimension seeds, login, ops table
 docker/
   airflow/                     Airflow image (Java, PySpark, JDBC + Kafka jars)
@@ -276,7 +280,8 @@ tests/                         PySpark + plain Python unit tests
 notebooks/                     exploration (outputs cleared)
 docker-compose.yml
 pyproject.toml                 ruff + pytest configuration
-.github/workflows/ci.yml       CI: ruff lint + Python unit tests
+.dockerignore                  keeps .git and notebooks out of the build context
+.github/workflows/ci.yml       CI: lint, tests, DAG import, compose, dbt parse
 ```
 
 Compose services, always on: SQL Server + its init job, object storage + bucket init, Postgres (Airflow metadata), Airflow (api-server, scheduler, dag-processor, triggerer, init). Optional profiles: `dev` (Jupyter), `tools` (dbt on demand) and `streaming` (Kafka, producer, consumer).
@@ -311,6 +316,7 @@ Compose services, always on: SQL Server + its init job, object storage + bucket 
 | **SQL Server inside Compose** | `docker compose up -d` becomes the entire setup, and `mssql-init` replaces a page of manual SSMS steps | A host installation (what the project started with) |
 | **Gold tracks its own processed pairs in object storage** | The Silver manifests already say what exists; a small JSON of what Gold consumed turns that into a watermark without adding a database | A column in SQL Server, Airflow XCom, reprocessing everything |
 | **Metrics written by the jobs, not by Airflow** | The job is the only place that knows row counts and per-stage timings; Airflow only knows that a task ended | Parsing task logs, a separate collector |
+| **One owner per table: dbt owns the facts and dim_symbol, SQL owns the seeded dimensions** | A table created by a DDL script and then materialized by dbt loses its constraints on the first `--full-refresh`, silently. Keys and checks are dbt hooks now, so they are restored after every build | DDL-only tables with dbt as a view layer, dbt contracts |
 
 ---
 
@@ -329,7 +335,20 @@ Compose services, always on: SQL Server + its init job, object storage + bucket 
 
 - `unique` and `not_null` on keys, `not_null` on `trade_count`.
 - `relationships` (referential integrity) from the fact to `dim_symbol`, `dim_date` and `dim_time`.
-- Custom tests: grain uniqueness `(date_key, time_key, symbol_key)` and price/volume consistency (`low <= open, close <= high`, volume >= 0, trade_count > 0).
+- Custom tests: grain uniqueness `(date_key, time_key, symbol_key)` and price/volume consistency (`low <= open, close <= high`, volume >= 0, trade_count > 0), the Fear & Greed 0-100 range, and `assert_api_facts_cover_staging`.
+
+### Warehouse constraints
+
+dbt owns `dim_symbol` and the three fact tables, so a `--full-refresh` drops and recreates them. Anything a DDL script had declared on those names -- primary key, foreign keys, check constraints -- would be gone, without an error. The constraints are therefore declared in `dbt/macros/warehouse_constraints.sql` and applied as model hooks:
+
+| Table | Constraints restored after every build |
+|---|---|
+| `dim_symbol` | `PK_dim_symbol (symbol_key)` |
+| `fact_candles_1m` | PK on the grain, FKs to all three dimensions, `high >= low`, `volume >= 0 and trade_count > 0` |
+| `fact_coin_market_daily` | PK `(date_key, symbol_key)`, FKs to `dim_date` and `dim_symbol`, `price_usd is null or > 0` |
+| `fact_fear_greed_daily` | PK `(date_key)`, FK to `dim_date`, `fng_value between 0 and 100` |
+
+Two details make this work on a repeat run. The `not null` step is guarded by `sys.columns.is_nullable`, because once the primary key exists SQL Server rejects even a no-op `ALTER COLUMN` on an indexed column. And `dim_symbol` has a **pre**-hook that drops every foreign key pointing at it: a referenced table cannot be dropped, so a full refresh would otherwise fail. dbt always builds `dim_symbol` before the facts, which re-add their keys straight afterwards.
 
 ### API source (Python)
 
@@ -428,6 +447,7 @@ Stage timings of the final run: download + unzip 2.0 s, read + parse 24.7 s, qua
 | Spark `OutOfMemoryError` on large monthly files | Raised driver memory (3g to 6g) and the WSL memory limit; reduced scope to fit a 16 GB machine |
 | Silver writes very slow (6,000+ tiny files per month) | Diagnosed with per-stage timings, then committer v2 and repartition (section 10) |
 | SQL Server error 8645 (timeout waiting for memory) during `dbt run` | Host RAM was exhausted by the WSL VM; freed memory by shutting down WSL, added an index on the staging table |
+| dbt silently dropped the star schema's keys | sql/01 created `dim_symbol` and `fact_candles_1m`, but dbt materializes the same names: the first `--full-refresh` replaced them with constraint-free tables. The DDL now stops at the seeded dimensions and every key, foreign key and check is a dbt hook |
 | Airflow UI crash (React error #185) with several Airflow instances on `localhost` | Conflicting browser cookies; used `127.0.0.1` and stopped unrelated containers |
 | Port conflicts and Docker Desktop instability with many containers running | Mapped Airflow to port 8085; stopped unrelated projects while working |
 

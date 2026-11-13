@@ -20,4 +20,7 @@ ALTER ROLE db_datawriter ADD MEMBER crypto_app;
 GO
 GRANT CREATE TABLE, CREATE VIEW TO crypto_app;
 GRANT ALTER ON SCHEMA::gold TO crypto_app;
+-- Needed so the dbt post-hooks can add foreign keys pointing at dim_date
+-- and dim_time: ALTER does not imply REFERENCES.
+GRANT REFERENCES ON SCHEMA::gold TO crypto_app;
 GO

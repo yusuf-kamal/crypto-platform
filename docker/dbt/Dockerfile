@@ -1,3 +1,7 @@
+# Build context is the repository root (see docker-compose.yml), so that the
+# dbt project can be copied into the image. The compose `dbt` service still
+# bind-mounts ./dbt over it for local iteration, while the Airflow DAG runs
+# the image as it is, with the project baked in.
 FROM python:3.11-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 DBT_PROFILES_DIR=/app/dbt
@@ -14,5 +18,7 @@ RUN apt-get update \
 
 WORKDIR /app/dbt
 
-COPY requirements.txt /tmp/requirements.txt
+COPY docker/dbt/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+COPY dbt/ /app/dbt/

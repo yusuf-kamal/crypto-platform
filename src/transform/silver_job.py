@@ -1,4 +1,3 @@
-import json
 import os
 import sys
 import tempfile
@@ -9,11 +8,16 @@ import boto3
 from pyspark import StorageLevel
 from pyspark.sql import functions as F
 
+from src.common.lake import (
+    QUARANTINE_AGGTRADES,
+    SILVER_AGGTRADES,
+    month_bounds,
+    symbol_date_predicate,
+    write_lake,
+)
+from src.common.observability import json_log, write_run_metrics
 from src.common.spark import get_spark
 from src.transform.silver_aggtrades import RAW_COLUMNS, parse_raw, tag_rejects
-
-SILVER = "s3a://silver/aggtrades"
-QUARANTINE = "s3a://silver/_quarantine/aggtrades"
 
 
 def run(symbol: str, month: str) -> dict:
@@ -60,21 +64,41 @@ def run(symbol: str, month: str) -> dict:
 
         rejected = tagged.filter(F.col("reject_reason").isNotNull())
         n_rejected = rejected.count()
-        rejected.write.mode("overwrite").partitionBy(
-            "symbol", "file_month").parquet(QUARANTINE)
+        write_lake(
+            rejected,
+            QUARANTINE_AGGTRADES,
+            partition_by=["symbol", "file_month"],
+            replace_where=(
+                f"symbol = '{symbol}' and file_month = '{month}'"
+            ),
+        )
         t = lap("quarantine_s", t)
 
         valid = (
             tagged.filter(F.col("reject_reason").isNull())
             .drop("reject_reason", "raw_record", "transact_micros")
-            .dropDuplicates(["agg_trade_id"])
+            # agg_trade_id is unique per *symbol*, not globally. One job
+            # handles one symbol, so the single-column version happened to
+            # be correct -- but it would silently delete real trades the
+            # moment a job ever covered two symbols.
+            .dropDuplicates(["symbol", "agg_trade_id"])
             .persist(StorageLevel.MEMORY_AND_DISK)
         )
         n_valid = valid.count()
         t = lap("dedupe_count_s", t)
-        valid.repartition(F.col("trade_date")).write.mode("overwrite").partitionBy(
-            "symbol", "trade_date").parquet(SILVER)
-        t = lap("write_valid_s", t)
+        # repartition by trade_date keeps one output file per day instead of
+        # the 200 tiny ones the default shuffle produced (section 10).
+        # replaceWhere states the slice this file owns, so a re-run can only
+        # ever replace its own symbol and days.
+        month_start, month_end = month_bounds(month)
+        write_lake(
+            valid.repartition(F.col("trade_date")),
+            SILVER_AGGTRADES,
+            partition_by=["symbol", "trade_date"],
+            replace_where=symbol_date_predicate(
+                symbol, month_start, month_end),
+        )
+        lap("write_valid_s", t)
 
         tagged.unpersist()
         valid.unpersist()
@@ -87,7 +111,16 @@ def run(symbol: str, month: str) -> dict:
         "seconds": round(time.time() - started, 1),
         "timings": timings,
     }
-    print(json.dumps(metrics))
+    json_log("silver_file_processed", **metrics)
+    write_run_metrics(spark, "silver", [{
+        "entity": f"{symbol}|{month}",
+        "status": "processed",
+        "rows_in": total,
+        "rows_valid": n_valid,
+        "rows_rejected": n_rejected,
+        "seconds": metrics["seconds"],
+        "details": {"timings": timings, "error_rate": metrics["error_rate"]},
+    }])
     return metrics
 
 

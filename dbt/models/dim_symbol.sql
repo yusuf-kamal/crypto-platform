@@ -1,4 +1,15 @@
-{{ config(materialized='incremental', unique_key='symbol') }}
+{{ config(
+    materialized='incremental',
+    unique_key='symbol',
+    pre_hook=["{{ drop_foreign_keys_referencing('gold', 'dim_symbol') }}"],
+    post_hook=[
+        "{{ not_null_columns([
+             {'name': 'symbol_key', 'type': 'int'},
+             {'name': 'symbol', 'type': 'varchar(20)'}
+           ]) }}",
+        "{{ add_primary_key('PK_dim_symbol', 'symbol_key') }}"
+    ]
+) }}
 
 with new_symbols as (
     select distinct symbol

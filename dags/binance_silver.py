@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 from airflow.sdk import dag, task
 
+from src.common.observability import on_failure_alert
 from src.common.assets import BRONZE_AGGTRADES, SILVER_AGGTRADES
 from src.common.config import MONTHS, SYMBOLS
 
@@ -17,7 +18,8 @@ log = logging.getLogger("airflow.task")
     schedule=[BRONZE_AGGTRADES],  
     catchup=False,
     tags=["silver"],
-    default_args={"retries": 1, "retry_delay": timedelta(minutes=2)},
+    default_args={"on_failure_callback": on_failure_alert,
+                  "retries": 1, "retry_delay": timedelta(minutes=2)},
 )
 def binance_silver():
     @task(max_active_tis_per_dag=1)

@@ -1,5 +1,15 @@
+# Provider versions are deliberately left to pip, so they resolve against
+# whatever apache/airflow:3.3.2 already ships. To make rebuilds fully
+# reproducible, freeze them once from the image that is known to work:
+#   docker compose exec airflow-scheduler pip freeze > docker/airflow/requirements.lock.txt
+# and then install from that file instead.
 apache-airflow-providers-amazon
 apache-airflow-providers-postgres
+# Lets the dbt_build DAG run the dbt image through the host Docker socket.
+apache-airflow-providers-docker
 requests
 pyspark==3.5.1
 jupyterlab
+# Baked in so `docker compose exec airflow-scheduler python -m pytest tests`
+# works without installing anything first.
+pytest==8.3.4

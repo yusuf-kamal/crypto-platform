@@ -1,0 +1,15 @@
+[tool.ruff]
+line-length = 100
+exclude = ["notebooks", "dbt/target", "dbt/logs"]
+
+[tool.ruff.lint]
+# ruff's default rule set (pycodestyle errors + pyflakes).
+select = ["E4", "E7", "E9", "F"]
+# E712 (comparison to True/False) cannot be followed inside PySpark
+# expressions: `F.col("x") == True` builds a Column, while `is True` would
+# evaluate the Column object itself and always be False.
+ignore = ["E712"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

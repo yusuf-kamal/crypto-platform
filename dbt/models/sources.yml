@@ -3,10 +3,37 @@ version: 2
 sources:
   - name: staging
     schema: staging
+    description: >
+      Hand-off buffer between Spark and dbt. Every table here is truncated
+      and refilled by the job that produces it, so it holds the current batch
+      only -- never history. The dbt models merge it into the facts.
     tables:
       - name: candles_1m
+        description: 1-minute candles written by the Gold Spark job.
+      - name: coin_market_daily
+        description: Daily CoinGecko market data written by the API job.
+      - name: fear_greed_daily
+        description: Daily Fear & Greed values written by the API job.
+
   - name: gold_seed
     schema: gold
+    description: >
+      Dimensions that are seeded by SQL scripts rather than built by dbt,
+      because they are generated date and time grids, not derived from source
+      data.
     tables:
       - name: dim_date
+        description: One row per calendar day, 2025-2027.
       - name: dim_time
+        description: One row per minute of the day. A constant 1,440 rows.
+
+  - name: ops
+    schema: ops
+    description: >
+      Operational metadata, written by the jobs themselves rather than
+      derived from source data.
+    tables:
+      - name: pipeline_runs
+        description: >
+          One row per entity a job processed: layer, entity, status, row
+          counts, duration and the job's own metrics as JSON.

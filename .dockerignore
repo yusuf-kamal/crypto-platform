@@ -1,0 +1,18 @@
+# The dbt and streaming images now build from the repository root, so without
+# this every build would ship the whole repo (including .git and notebook
+# checkpoints) to the Docker daemon.
+.git
+.github
+.venv
+__pycache__/
+*.pyc
+.env
+logs/
+data/
+notebooks/
+docs/
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/
+.ipynb_checkpoints/
+*.log

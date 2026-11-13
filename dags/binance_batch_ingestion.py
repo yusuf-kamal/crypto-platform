@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 
 import requests
 from airflow.sdk import dag, task
+from src.common.observability import on_failure_alert
 from src.common.assets import BRONZE_AGGTRADES
 from src.common.config import MONTHS, SYMBOLS
 
@@ -25,7 +26,8 @@ CONN_ID = "minio_s3"
     schedule=None,
     catchup=False,
     tags=["bronze", "batch"],
-    default_args={"retries": 3, "retry_delay": timedelta(minutes=2)},
+    default_args={"on_failure_callback": on_failure_alert,
+                  "retries": 3, "retry_delay": timedelta(minutes=2)},
 )
 def binance_batch_ingestion():
     @task(max_active_tis_per_dag=2)

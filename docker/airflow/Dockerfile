@@ -10,6 +10,14 @@ ENV JAVA_HOME=/opt/java
 # Spark jars: S3A (object store), SQL Server JDBC, the Kafka source for
 # Structured Streaming, and Delta Lake for the Silver layer. Versions match
 # PySpark 3.5.1 / Scala 2.12 (delta-spark 3.2.0 is the Spark 3.5 line).
+#
+# kafka-clients stays at 3.4.1 on purpose, even though the broker in
+# docker-compose.yml is Kafka 3.9.0. 3.4.1 is the version
+# spark-sql-kafka-0-10_2.12:3.5.1 declares as its own dependency, so it is
+# what Spark was built against -- not a pin someone forgot to bump. Kafka has
+# had bidirectional client/broker compatibility since 0.10.2 and an older
+# client against a newer broker is the supported direction; "fixing" this to
+# 3.9.0 would introduce a mismatch rather than remove one.
 RUN mkdir -p /opt/spark-jars && cd /opt/spark-jars \
     && curl -fsSLO https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar \
     && curl -fsSLO https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar \

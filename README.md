@@ -512,6 +512,8 @@ Stage timings of the final run: download + unzip 2.0 s, read + parse 24.7 s, qua
 
 ## 13. Versions
 
+The version spread between `kafka-clients 3.4.1` and the Kafka 3.9.0 broker is deliberate: 3.4.1 is what `spark-sql-kafka-0-10:3.5.1` declares as its dependency, and an older client against a newer broker is the supported direction (Kafka has had bidirectional client/broker compatibility since 0.10.2). Raising it to match the broker would create a mismatch, not fix one.
+
 Airflow 3.3.2 (Python 3.13) · PySpark 3.5.1 · Java 17 · hadoop-aws 3.3.4 · Microsoft JDBC driver 13.4.0 (jre11) · Postgres 16 · dbt-core 1.12.6 · dbt-sqlserver 1.12.1 · pyodbc 5.3.0 · ODBC Driver 18 for SQL Server · `pgsty/silo` RELEASE.2026-09-16T00-00-00Z · SQL Server 2022 (Developer, in Compose) · Kafka 3.9.0 (KRaft, single node) · spark-sql-kafka-0-10 3.5.1 · delta-spark 3.2.0 (jars) · websocket-client 1.8.0 · confluent-kafka 2.6.0
 
 ## 14. Data source terms

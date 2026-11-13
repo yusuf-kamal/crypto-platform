@@ -6,12 +6,18 @@ and reproducible, the stream is fresh but only covers the time the consumer
 was running -- and mixing them in one table would make neither trustworthy.
 
 Append mode only emits a candle once its window is closed by the watermark,
-so a published Parquet file is never rewritten.
+so a published file is never rewritten. The sink uses the same format as the
+rest of Silver (Delta by default), so a reader never sees a partial commit.
 """
 
 import os
 import sys
 
+from src.common.lake import (
+    LAKE_FORMAT,
+    SILVER_STREAM_CANDLES,
+    STREAM_CHECKPOINT,
+)
 from src.common.spark import get_spark
 from src.streaming.trade_events import (
     parse_trade_events,
@@ -22,8 +28,6 @@ from src.streaming.trade_events import (
 TOPIC = os.environ.get("KAFKA_TOPIC", "binance.trades")
 BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "kafka:9092")
 
-SILVER_STREAM = "s3a://silver/stream_candles_1m"
-CHECKPOINT = "s3a://silver/_checkpoints/stream_candles_1m"
 WATERMARK = os.environ.get("STREAM_WATERMARK", "2 minutes")
 TRIGGER_INTERVAL = os.environ.get("STREAM_TRIGGER", "1 minute")
 
@@ -47,11 +51,11 @@ def main() -> int:
         valid_trades(parse_trade_events(kafka)), WATERMARK)
 
     query = (
-        candles.writeStream.format("parquet")
-        .option("path", SILVER_STREAM)
+        candles.writeStream.format(LAKE_FORMAT)
+        .option("path", SILVER_STREAM_CANDLES)
         # The checkpoint is what makes a restart exactly-once for the sink:
         # it holds the Kafka offsets and the open window state.
-        .option("checkpointLocation", CHECKPOINT)
+        .option("checkpointLocation", STREAM_CHECKPOINT)
         .partitionBy("symbol")
         .outputMode("append")
         .trigger(processingTime=TRIGGER_INTERVAL)

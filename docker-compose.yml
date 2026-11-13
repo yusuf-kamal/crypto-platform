@@ -29,6 +29,8 @@ x-airflow-common: &airflow-common
     ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
     KAFKA_BOOTSTRAP: kafka:9092
     KAFKA_TOPIC: binance.trades
+    # Silver layer format: delta (default) or parquet as a fallback.
+    LAKE_FORMAT: ${LAKE_FORMAT:-delta}
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs

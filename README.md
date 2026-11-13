@@ -32,7 +32,7 @@ The volatility view is also where the two sources meet: the candle fact gives th
 | Data lake with Bronze / Silver / Gold buckets (S3-compatible) | Done |
 | Silver: Spark typing, cleaning, de-duplication, quarantine | Done |
 | Warehouse: SQL Server star schema, dbt incremental models | Done |
-| Data quality: 54 Python unit tests, 33 dbt tests | Done (13 of the dbt tests are verified against real data; the 20 on the API facts and the reporting views have not been run yet) |
+| Data quality: 62 Python unit tests, 33 dbt tests | Done (13 of the dbt tests are verified against real data; the 20 on the API facts and the reporting views have not been run yet) |
 | Orchestration: 6 Airflow DAGs chained with Assets | Done |
 | Airflow task that runs dbt (run, test, docs generate) | Done |
 | Gold recomputes only newly processed Silver files | Done |
@@ -44,7 +44,8 @@ The volatility view is also where the two sources meet: the candle fact gives th
 | Warehouse keys and checks survive a dbt `--full-refresh` | Done |
 | Reporting views, one per business question, with their own grain and range tests | Done |
 | Power BI dashboard on top of those views | Planned |
-| Delta Lake or Iceberg, CDC, Terraform | Not started |
+| Delta Lake on the Silver layer (atomic writes, `replaceWhere`, time travel) | Code complete, not yet run |
+| Iceberg, CDC, Terraform | Not started |
 
 ---
 
@@ -54,7 +55,7 @@ The volatility view is also where the two sources meet: the candle fact gives th
 flowchart LR
     A[Binance public archive<br/>aggTrades zip files] -->|binance_batch_ingestion| B[(Bronze<br/>raw zip + checksum verified)]
     B -->|Asset| C[binance_silver<br/>Spark local mode]
-    C --> D[(Silver<br/>Parquet by symbol / trade_date)]
+    C --> D[(Silver<br/>Delta by symbol / trade_date)]
     C --> Q[(Quarantine<br/>rejected rows + reason)]
     D -->|Asset| E[binance_gold<br/>Spark: 1-minute candles]
     E --> F[(SQL Server<br/>staging.candles_1m)]
@@ -62,7 +63,7 @@ flowchart LR
     N --> G[(SQL Server gold<br/>star schema)]
     I[CoinGecko API<br/>Fear & Greed API] -->|api_daily_ingestion| J[(Bronze<br/>raw JSON per day)]
     J -->|Asset| K[api_daily_warehouse<br/>parse + validate]
-    K --> L[(Silver<br/>daily Parquet)]
+    K --> L[(Silver<br/>Delta, daily)]
     K --> M[(SQL Server<br/>staging.coin_market_daily<br/>staging.fear_greed_daily)]
     M -->|Asset| N
     S[Binance WebSocket<br/>live trades] -->|trade-producer| T[(Kafka<br/>binance.trades)]
@@ -129,7 +130,8 @@ erDiagram
 | Source | Binance Public Data archive (`data.binance.vision`), spot monthly `aggTrades` |
 | Scope | BTCUSDT, ETHUSDT, BNBUSDT, SOLUSDT, XRPUSDT; months 2026-06 to 2026-10 (set in `src/common/config.py`) |
 | Gold fact rows | **1,101,600** (220,320 per symbol = 153 days x 1,440 minutes) |
-| Silver trade rows | An earlier snapshot (3 symbols, mixed months) measured 214,820,655 trades. Final count for the 5x5 scope: `<TODO: spark.read.parquet("s3a://silver/aggtrades").count()>` |
+| Silver trade rows | **339,801,204** for the 5x5 scope. Derived from the per-(symbol, month) counts in `notebooks/01_explore_silver_and_candles.ipynb`, whose lake snapshot also held two 2026-05 files that are outside the final scope; the lake as measured there held 364,096,716 rows in total |
+| Silver rows per symbol (5x5 scope) | BTCUSDT 134,640,856 - ETHUSDT 113,395,176 - BNBUSDT 39,494,244 - XRPUSDT 27,584,014 - SOLUSDT 24,686,914 |
 
 Raw columns of an `aggTrades` file: aggregate trade id, price, quantity, first trade id, last trade id, transact time (microseconds in the 2026 files), is-buyer-maker, is-best-match. Files have no header.
 
@@ -170,6 +172,7 @@ Fill in `.env` (never commit it). The file lists every variable with a comment; 
 | `MSSQL_SA_PASSWORD` | SQL Server `sa` password, used only by `mssql-init` |
 | `MSSQL_PASSWORD` | Password for `crypto_app`, the least-privilege login the pipeline uses |
 | `ALERT_WEBHOOK_URL` | Optional. Empty means failures are logged but not pushed anywhere |
+| `LAKE_FORMAT` | `delta` by default. Set it to `parquet` to fall back to the pre-Delta behaviour without touching a job |
 
 Generate each Airflow secret with:
 
@@ -258,7 +261,8 @@ src/
   common/
     config.py                  symbols, months, coin ids, lookback
     assets.py                  the Airflow Assets that chain the DAGs
-    spark.py                   Spark session factory (S3A, JDBC, Kafka jars)
+    spark.py                   Spark session factory (S3A, JDBC, Kafka, Delta)
+    lake.py                    lake paths, format, and replaceWhere predicates
     observability.py           structured logging, run metrics, failure alerts
   ingestion/
     api_sources.py             HTTP access to both public REST APIs
@@ -284,7 +288,7 @@ docker/
   mssql/init.sh                applies sql/ once SQL Server is up
   streaming/                   small image for the WebSocket producer
 tests/                         PySpark + plain Python unit tests
-notebooks/                     exploration (outputs cleared)
+notebooks/                     exploration (outputs kept: they are the row counts quoted in section 4)
 docker-compose.yml
 pyproject.toml                 ruff + pytest configuration
 .dockerignore                  keeps .git and notebooks out of the build context
@@ -303,7 +307,9 @@ Compose services, always on: SQL Server + its init job, object storage + bucket 
 | **S3-compatible store (`pgsty/silo`, a community MinIO fork)** | Official MinIO images were removed from Docker Hub in September 2026; the fork keeps the same S3 API and `MINIO_*` variables | Official MinIO images, RustFS, SeaweedFS |
 | **Bronze keeps the raw zip untouched** | Re-processing from the original is always possible; no information is lost | Convert to Parquet at ingestion |
 | **Spark in `local[4]` mode** | One monthly file is hundreds of MB; a single machine is enough and a Spark cluster would waste RAM. The code is unchanged if `master` is later pointed at a cluster | Spark standalone cluster, pandas |
-| **Parquet partitioned by `symbol` / `trade_date`** | Columnar, compressed, prunes partitions on reads | CSV, Delta Lake / Iceberg (planned as an advanced feature) |
+| **Delta Lake for Silver, partitioned by `symbol` / `trade_date`** | Columnar and partition-pruned like plain Parquet, plus an atomic commit (a dead job leaves nothing behind instead of half a write), `replaceWhere`, and time travel for inspecting a bad run afterwards | Plain Parquet (what this started as), Iceberg, Hudi |
+| **`replaceWhere` instead of dynamic partition overwrite** | The job states up front which slice it may replace, and Delta rejects the write if the data does not match. A wrong predicate becomes an error rather than silent data loss | Dynamic partition overwrite, MERGE on `agg_trade_id` (too slow against a 340 M-row table for a whole-file reload) |
+| **Delta as jars, not the `delta-spark` pip package** | That package pins its own PySpark version, which would fight the 3.5.1 the image is built around, and nothing here needs the Python `DeltaTable` API | pip install delta-spark |
 | **1-minute candles as the warehouse grain** | About 1.1 M rows instead of ~100 M+ trades; fine enough to roll up to hour or day | Trade-level fact (too large for SQL Server and BI), hourly candles (too coarse) |
 | **Spark for the heavy aggregation, dbt for modeling** | Trades live in the lake and are too large to load into SQL Server; dbt gives incremental merge, tests and lineage on the small candle table | Spark-only Gold layer |
 | **Separate `dim_date` and `dim_time`** | `dim_time` is a constant 1,440 rows; a combined date-time dimension would grow with every day | Single `dim_datetime` |
@@ -336,7 +342,8 @@ Compose services, always on: SQL Server + its init job, object storage + bucket 
 - Timestamp unit is detected from digit count (13 = milliseconds, 16 = microseconds) so older files with a different unit can be read; covered by a unit test, not yet exercised on older real files.
 - Derived columns: `side` (BUY / SELL from `is_buyer_maker`), `quote_value = price x quantity`, `trade_date`.
 - **Quarantine:** rows are rejected, with a `reject_reason`, when a required field is null or unparseable, price or quantity is not positive, the trade-id range is invalid, or the trade falls outside the file's month. Invalid rows never fail the job. On the real data so far, **0 rows were rejected** (rules are verified by unit tests).
-- De-duplication on `agg_trade_id`.
+- De-duplication on `(symbol, agg_trade_id)`. The id is unique per symbol, not globally: one job handles one symbol, so de-duplicating on the id alone happened to be correct, but it would have silently deleted real trades the moment a job covered two symbols.
+- The write is a single Delta commit scoped with `replaceWhere` to this file's symbol and days, so a re-run can only ever replace its own slice, and a reader never sees a partial write. The quarantine rule that rejects out-of-month trades is what guarantees the written rows satisfy that predicate.
 - A per-file manifest (row counts, rejected count, error rate, per-stage timings) is written after each successful run.
 
 ### Gold (dbt): 33 tests
@@ -395,7 +402,7 @@ Two details make this work on a repeat run. The `not null` step is guarded by `s
 |---|---|
 | Bronze (files) | Existing object keys are skipped; downloads are checksum-verified; 3 retries |
 | Bronze (APIs) | The raw JSON is written under the run's logical date, so a re-run replaces its own day only |
-| Silver | Per-file manifest; Parquet written with dynamic partition overwrite |
+| Silver | Per-file manifest; one atomic Delta commit scoped by `replaceWhere` to that file's symbol and days |
 | Gold | Processes only the (symbol, month) pairs not in its own watermark file; `full_refresh` recomputes everything |
 | Staging | Rebuilt on every run (`truncate` + load); it holds the current batch, never history |
 | Warehouse | dbt incremental models merge on each fact's composite key, so a repeated batch does not duplicate rows |
@@ -411,7 +418,8 @@ Two details make this work on a repeat run. The `not null` step is guarded by `s
 - `trustServerCertificate=true` / `trust_cert: true` is used for SQL Server's self-signed certificate. Do not use it in production.
 - Airflow runs without a login and Jupyter without a token; both are bound for local use only.
 - To use a SQL Server on the host instead of the container, set `MSSQL_HOST=host.docker.internal` and its port in `.env`, stop the `mssql` service, and apply `sql/` by hand in SSMS (in the order listed in step 2). The firewall rule is then also needed: `New-NetFirewallRule -DisplayName "SQL Server 14330" -Direction Inbound -Protocol TCP -LocalPort 14330 -Action Allow`.
-- Committer algorithm v2 (below) is faster but can leave partial files if a job dies mid-write; jobs are re-run with overwrite, which repairs this.
+- Committer algorithm v2 (section 10) only applies on the `LAKE_FORMAT=parquet` fallback; Delta commits through its own transaction log and never leaves a partial write visible. The measurements in section 10 were taken on the parquet path.
+- Nothing runs `OPTIMIZE` or `VACUUM` on the Delta tables yet, so old file versions accumulate. Time travel works; disk use grows.
 - Performance numbers below are single runs on one laptop, not averaged benchmarks, and none of them cover the streaming path.
 
 ---
@@ -476,7 +484,7 @@ Stage timings of the final run: download + unzip 2.0 s, read + parse 24.7 s, qua
 
 ## 13. Versions
 
-Airflow 3.3.2 (Python 3.13) · PySpark 3.5.1 · Java 17 · hadoop-aws 3.3.4 · Microsoft JDBC driver 13.4.0 (jre11) · Postgres 16 · dbt-core 1.12.6 · dbt-sqlserver 1.12.1 · pyodbc 5.3.0 · ODBC Driver 18 for SQL Server · `pgsty/silo` RELEASE.2026-09-16T00-00-00Z · SQL Server 2022 (Developer, in Compose) · Kafka 3.9.0 (KRaft, single node) · spark-sql-kafka-0-10 3.5.1 · websocket-client 1.8.0 · confluent-kafka 2.6.0
+Airflow 3.3.2 (Python 3.13) · PySpark 3.5.1 · Java 17 · hadoop-aws 3.3.4 · Microsoft JDBC driver 13.4.0 (jre11) · Postgres 16 · dbt-core 1.12.6 · dbt-sqlserver 1.12.1 · pyodbc 5.3.0 · ODBC Driver 18 for SQL Server · `pgsty/silo` RELEASE.2026-09-16T00-00-00Z · SQL Server 2022 (Developer, in Compose) · Kafka 3.9.0 (KRaft, single node) · spark-sql-kafka-0-10 3.5.1 · delta-spark 3.2.0 (jars) · websocket-client 1.8.0 · confluent-kafka 2.6.0
 
 ## 14. Data source terms
 

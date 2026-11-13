@@ -26,6 +26,13 @@ from pyspark.sql.types import (
 )
 
 from src.common.config import COINGECKO_IDS
+from src.common.lake import (
+    QUARANTINE_COIN_MARKET,
+    QUARANTINE_FEAR_GREED,
+    SILVER_COIN_MARKET,
+    SILVER_FEAR_GREED,
+    write_lake,
+)
 from src.common.observability import json_log, write_run_metrics
 from src.common.spark import get_spark
 from src.transform.api_daily import (
@@ -37,11 +44,6 @@ from src.transform.api_daily import (
 BRONZE_BUCKET = "bronze"
 MARKET_KEY = "coingecko/market_chart/coin_id={coin_id}/{ds}.json"
 FNG_KEY = "alternative_me/fear_greed/{ds}.json"
-
-SILVER_MARKET = "s3a://silver/coin_market_daily"
-SILVER_FNG = "s3a://silver/fear_greed_daily"
-QUARANTINE_MARKET = "s3a://silver/_quarantine/coin_market_daily"
-QUARANTINE_FNG = "s3a://silver/_quarantine/fear_greed_daily"
 
 STAGING_MARKET = "staging.coin_market_daily"
 STAGING_FNG = "staging.fear_greed_daily"
@@ -127,20 +129,25 @@ def run(ds: str) -> dict:
     # These are daily aggregates: a few thousand rows, not millions. One
     # partition per table keeps the object store free of tiny files.
     for rows, schema, silver_path, staging in (
-        (market_valid, MARKET_SCHEMA, SILVER_MARKET, STAGING_MARKET),
-        (fng_valid, FNG_SCHEMA, SILVER_FNG, STAGING_FNG),
+        (market_valid, MARKET_SCHEMA, SILVER_COIN_MARKET, STAGING_MARKET),
+        (fng_valid, FNG_SCHEMA, SILVER_FEAR_GREED, STAGING_FNG),
     ):
         df = spark.createDataFrame(rows, schema).coalesce(1)
-        df.write.mode("overwrite").parquet(silver_path)
+        # The API returns its whole lookback window every run, so the
+        # dataset is replaced wholesale rather than sliced. In Delta that
+        # replacement is a single atomic commit.
+        write_lake(df, silver_path)
         _write_staging(df.drop("source_ts_ms"), staging)
 
     for rows, schema, path in (
-        (market_rejected, MARKET_SCHEMA, QUARANTINE_MARKET),
-        (fng_rejected, FNG_SCHEMA, QUARANTINE_FNG),
+        (market_rejected, MARKET_SCHEMA, QUARANTINE_COIN_MARKET),
+        (fng_rejected, FNG_SCHEMA, QUARANTINE_FEAR_GREED),
     ):
         if rows:
-            (spark.createDataFrame(rows, _with_reason(schema))
-             .coalesce(1).write.mode("overwrite").parquet(path))
+            write_lake(
+                spark.createDataFrame(rows, _with_reason(schema)).coalesce(1),
+                path,
+            )
 
     metrics = {
         "ds": ds,

@@ -16,6 +16,7 @@ from functools import reduce
 
 from pyspark.sql import functions as F
 
+from src.common.lake import SILVER_AGGTRADES, read_lake
 from src.common.observability import json_log, write_run_metrics
 from src.common.spark import get_spark
 from src.transform.gold_candles import build_candles_1m
@@ -122,7 +123,7 @@ def run(symbols: list[str], months: list[str],
         [(F.col("symbol") == s) & (F.col("file_month") == m) for s, m in todo],
     )
 
-    trades = spark.read.parquet("s3a://silver/aggtrades").filter(pair_filter)
+    trades = read_lake(spark, SILVER_AGGTRADES).filter(pair_filter)
 
     candles = build_candles_1m(trades).select(
         "symbol",

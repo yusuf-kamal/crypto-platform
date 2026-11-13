@@ -5,6 +5,8 @@ sources:
     schema: staging
     tables:
       - name: candles_1m
+      - name: coin_market_daily
+      - name: fear_greed_daily
   - name: gold_seed
     schema: gold
     tables:

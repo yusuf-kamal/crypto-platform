@@ -26,16 +26,17 @@ Raw Binance trade files are huge (tens of millions of rows per symbol per month)
 | Data lake with Bronze / Silver / Gold buckets (S3-compatible) | Done |
 | Silver: Spark typing, cleaning, de-duplication, quarantine | Done |
 | Warehouse: SQL Server star schema, dbt incremental models | Done |
-| Data quality: 8 PySpark unit tests, 13 dbt tests (all passing) | Done |
+| Data quality: 35 Python unit tests, 24 dbt tests | Done (the 13 candle-path dbt tests are verified; the 11 API tests have not been run yet) |
 | Orchestration: 3 Airflow DAGs chained with Assets | Done |
 | Performance tuning with before/after measurements | Done (Silver write path) |
 | Run the platform with Docker Compose | Partly (SQL Server runs natively, see [Limitations](#9-known-limitations)) |
 | Streaming source (Binance WebSocket → Kafka → Spark Structured Streaming) | Planned |
-| Second source type (CoinGecko API, Fear & Greed Index API) | Planned |
+| Second source type: CoinGecko API + Fear & Greed Index API (daily grain) | Done |
 | Airflow task that runs dbt (today dbt is run manually through a compose profile) | Planned |
 | Power BI dashboard on the Gold layer | Planned |
 | Structured logging, metrics table, failure alerts | Planned |
-| Unit tests for the Gold candle function, GitHub Actions CI | Planned |
+| GitHub Actions CI (ruff lint + PySpark unit tests on every push) | Done |
+| Unit tests for the Gold candle function (7 tests) | Done |
 | Lineage / data catalog (`dbt docs`), Delta Lake or Iceberg, CDC, Terraform | Not started |
 
 ---
@@ -51,6 +52,11 @@ flowchart LR
     D -->|Asset| E[binance_gold<br/>Spark: 1-minute candles]
     E --> F[(SQL Server<br/>staging.candles_1m)]
     F -->|dbt incremental| G[(SQL Server gold<br/>star schema)]
+    I[CoinGecko API<br/>Fear & Greed API] -->|api_daily_ingestion| J[(Bronze<br/>raw JSON per day)]
+    J -->|Asset| K[api_daily_warehouse<br/>parse + validate]
+    K --> L[(Silver<br/>daily Parquet)]
+    K --> M[(SQL Server<br/>staging.coin_market_daily<br/>staging.fear_greed_daily)]
+    M -->|dbt incremental| G
     G -.->|planned| H[Power BI]
 ```
 
@@ -116,6 +122,15 @@ erDiagram
 
 Raw columns of an `aggTrades` file: aggregate trade id, price, quantity, first trade id, last trade id, transact time (microseconds in the 2026 files), is-buyer-maker, is-best-match. Files have no header.
 
+### Source type 2: public REST APIs (daily grain)
+
+| Item | Value |
+|---|---|
+| CoinGecko | `/coins/{id}/market_chart?vs_currency=usd&days=365` -- daily price, market cap and 24h volume per coin. The free tier returns hourly points below 90 days and daily points above, so 365 keeps the grain daily without a paid `interval` parameter. |
+| alternative.me | `/fng/?limit=0` -- the crypto Fear & Greed index, one value per day, market-wide. Every field arrives as a string and the timestamp is in epoch seconds. |
+| Grain | One row per day (per symbol for CoinGecko, market-wide for Fear & Greed), joined to the same `gold.dim_date` as the candle fact. |
+| Why these two | They answer questions the trade data cannot: how our measured volume compares with the whole market (`market_cap_usd`, `total_volume_usd`) and whether a volatile day was a fearful or a greedy one. |
+
 ---
 
 ## 5. How to run
@@ -155,6 +170,7 @@ docker run --rm python:3.12-slim python -c "import secrets,base64; print(base64.
 sql/01_create_gold.sql      -- database, gold schema, dim_date, dim_time
 sql/02_seed_dims.sql        -- fills dim_date (2026-2027) and dim_time (1,440 rows)
 sql/03_create_staging.sql   -- staging.candles_1m
+sql/04_create_api_staging.sql -- API staging tables + dim_date top-up for 2025
 ```
 
 Then create the least-privilege login used by Spark and dbt:
@@ -190,6 +206,8 @@ docker compose up -d
 
 **4. Run the pipeline**
 
+The API source is independent of the Binance path: trigger `api_daily_ingestion` (or let its daily schedule do it) and `api_daily_warehouse` starts automatically through its Asset.
+
 Trigger `binance_batch_ingestion` in the Airflow UI. When it finishes, `binance_silver` starts automatically (Asset), and when that finishes `binance_gold` starts automatically.
 
 **5. Build and test the warehouse models**
@@ -208,7 +226,6 @@ docker compose --profile dev up -d jupyter    # http://localhost:8888
 Run the PySpark unit tests inside the Airflow image:
 
 ```powershell
-docker compose exec airflow-scheduler python -m pip install pytest
 docker compose exec airflow-scheduler python -m pytest tests -q
 ```
 
@@ -221,6 +238,8 @@ dags/
   binance_batch_ingestion.py   Bronze: download, checksum-verify, upload
   binance_silver.py            Silver: one Spark task per (symbol, month)
   binance_gold.py              Gold: candles -> SQL Server staging
+  api_daily_ingestion.py       Bronze: CoinGecko + Fear & Greed JSON, one file per day
+  api_daily_warehouse.py       Silver + staging for the API source
 src/
   common/                      config, Airflow Assets, Spark session factory
   transform/
@@ -228,12 +247,18 @@ src/
     silver_job.py              Silver I/O + metrics
     gold_candles.py            1-minute candle aggregation (pure)
     gold_job.py                reads Silver, writes staging via JDBC
-dbt/                           dim_symbol, fact_candles_1m, tests
+    api_daily.py               API JSON -> daily rows (pure)
+    api_job.py                 API Silver + staging
+  ingestion/
+    api_sources.py             HTTP access to both public REST APIs
+dbt/                           dim_symbol, 3 fact models, tests
 sql/                           DDL and dimension seed scripts
 docker/                        Airflow image (Java, PySpark, JDBC) and dbt image (ODBC)
-tests/                         PySpark unit tests
+tests/                         PySpark + plain Python unit tests
 notebooks/                     exploration (outputs cleared)
 docker-compose.yml
+pyproject.toml                 ruff + pytest configuration
+.github/workflows/ci.yml       CI: ruff lint + PySpark unit tests
 ```
 
 Compose services: object storage + bucket init, Postgres (Airflow metadata), Airflow (api-server, scheduler, dag-processor, triggerer, init). Optional profiles: `dev` (Jupyter) and `tools` (dbt).
@@ -256,6 +281,10 @@ Compose services: object storage + bucket init, Postgres (Airflow metadata), Air
 | **Airflow 3 Assets to chain DAGs** | Downstream DAG runs when upstream data is actually published; no fixed schedule guessing | Time-based schedules, `TriggerDagRunOperator` |
 | **Python for Airflow tasks, separate pure functions** | Transform functions have no I/O, so they are unit-testable | Logic inside the DAG files |
 | **dbt in its own container (Python 3.11)** | Pinned, known-good adapter versions (`dbt-core 1.12.6`, `dbt-sqlserver 1.12.1`) separate from the Airflow image (Python 3.13) | Installing dbt in the Airflow image |
+| **The API source lands on a daily grain, not minutes** | Both APIs only publish one value per day. Upsampling to minutes would invent data; keeping the natural grain means `dim_date` joins both facts | Forward-filling onto the minute fact |
+| **Two separate API facts instead of one** | `fact_coin_market_daily` is per symbol, `fact_fear_greed_daily` is market-wide. Putting the index on the per-symbol fact would repeat it five times a day | One wide daily fact |
+| **Raw JSON kept untouched in Bronze** | Same reason as the Binance zip: a schema change at the API never costs us the payload we already fetched | Parse on ingestion |
+| **API amounts stored as DECIMAL, carried as double** | The values arrive as JSON floats, so they were never exact; the warehouse column is DECIMAL so arithmetic matches the candle fact | Decimal end to end (false precision) |
 
 ---
 
@@ -270,11 +299,28 @@ Compose services: object storage + bucket init, Postgres (Airflow metadata), Air
 - De-duplication on `agg_trade_id`.
 - A per-file manifest (row counts, rejected count, error rate, per-stage timings) is written after each successful run.
 
-### Gold (dbt): 13 tests, all passing
+### Gold (dbt): 24 tests
 
 - `unique` and `not_null` on keys, `not_null` on `trade_count`.
 - `relationships` (referential integrity) from the fact to `dim_symbol`, `dim_date` and `dim_time`.
 - Custom tests: grain uniqueness `(date_key, time_key, symbol_key)` and price/volume consistency (`low <= open, close <= high`, volume >= 0, trade_count > 0).
+
+### API source (Python)
+
+- The raw JSON is written untouched to Bronze under the run's logical date, so a re-run replaces its own day only.
+- `market_chart_rows()` joins the three CoinGecko arrays (`prices`, `market_caps`, `total_volumes`) **by timestamp**, not by position: a missing point in one array leaves a null instead of shifting every later value onto the wrong day.
+- Parsing never raises on bad input. An unparseable number or timestamp becomes `None`, and `reject_reason()` then decides whether the row is quarantined -- the same "never fail the job" rule as the Silver quarantine. The rules are:
+
+| Reject reason | Applies to | Why |
+|---|---|---|
+| `null_or_unparseable_date` | both | Without a date the row cannot join `dim_date` at all |
+| `partial_or_unparseable_day` | both | CoinGecko's last point is the *running* day, stamped at "now" instead of midnight. Keeping it would make the newest row change on every run |
+| `null_price`, `non_positive_price` | market | Same rule as `non_positive_price_or_quantity` in Silver |
+| `null_or_unparseable_fng_value`, `fng_value_out_of_range` | Fear & Greed | The index is defined on a 0-100 scale |
+| `missing_fng_classification` | Fear & Greed | The label is what the dashboard groups by |
+
+  A missing `market_cap_usd` or `total_volume_usd` is deliberately **not** a reject: CoinGecko omits them now and then, and dropping the row would throw away that day's valid price too. Those columns carry nulls into the fact instead.
+- `dim_date` is topped up back to 2025 by `sql/04`, because the fact models join it with an inner join and a missing day would otherwise vanish without an error. `assert_api_facts_cover_staging` fails if that ever happens.
 
 ### Re-running safely
 
@@ -292,7 +338,7 @@ Compose services: object storage + bucket init, Postgres (Airflow metadata), Air
 - **Not yet a single-command start.** SQL Server runs natively on the host, so the SQL setup in step 2 is manual. A SQL Server container with an init service is the planned fix.
 - The Gold Spark job recomputes the whole configured scope on every run instead of only newly processed files.
 - dbt is not yet orchestrated by Airflow.
-- Only one source type is implemented (Binance files); streaming and API sources are planned.
+- Two source types are implemented (Binance archive files, two REST APIs); streaming is still planned.
 - `trustServerCertificate=true` / `trust_cert: true` is used for the local SQL Server's self-signed certificate. Do not use it in production.
 - Airflow runs without a login and Jupyter without a token; both are bound for local use only.
 - Committer algorithm v2 (below) is faster but can leave partial files if a job dies mid-write; jobs are re-run with overwrite, which repairs this.

@@ -30,3 +30,31 @@ models:
               field: symbol_key
       - name: trade_count
         tests: [not_null]
+  - name: fact_coin_market_daily
+    description: Daily price, market cap and 24h volume per symbol (CoinGecko).
+    columns:
+      - name: date_key
+        tests:
+          - not_null
+          - relationships:
+              to: source('gold_seed', 'dim_date')
+              field: date_key
+      - name: symbol_key
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_symbol')
+              field: symbol_key
+
+  - name: fact_fear_greed_daily
+    description: Daily market-wide Fear & Greed index (alternative.me).
+    columns:
+      - name: date_key
+        tests:
+          - unique
+          - not_null
+          - relationships:
+              to: source('gold_seed', 'dim_date')
+              field: date_key
+      - name: fng_classification
+        tests: [not_null]

@@ -12,6 +12,7 @@ import pytest
 
 pytest.importorskip("airflow", reason="only runs in the Airflow CI job")
 
+import inspect  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 from airflow.models import DagBag  # noqa: E402
@@ -31,7 +32,15 @@ EXPECTED_DAG_IDS = {
 
 @pytest.fixture(scope="module")
 def dag_bag():
-    return DagBag(dag_folder=str(DAGS_DIR), include_examples=False)
+    # DagBag's signature changed across Airflow versions -- `include_examples`
+    # is gone in Airflow 3.3 -- and this test is meant to survive an upgrade
+    # rather than become the thing that breaks on one. Examples are off via
+    # AIRFLOW__CORE__LOAD_EXAMPLES anyway; the keyword is only passed when the
+    # installed version still accepts it.
+    kwargs = {"dag_folder": str(DAGS_DIR)}
+    if "include_examples" in inspect.signature(DagBag.__init__).parameters:
+        kwargs["include_examples"] = False
+    return DagBag(**kwargs)
 
 
 def test_no_import_errors(dag_bag):

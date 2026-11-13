@@ -195,7 +195,9 @@ docker run --rm python:3.12-slim python -c "import secrets,base64; print(base64.
 docker compose up -d
 ```
 
-That is the whole setup. The `mssql-init` service waits for SQL Server, then applies every script in `sql/` in alphabetical order, which is also the correct order:
+The first run builds three images, and the Airflow one downloads about 280 MB of Spark jars from Maven -- most of it the single `aws-java-sdk-bundle` at 268 MB. Expect roughly ten minutes before anything starts; it is not hung.
+
+The `mssql-init` service then waits for SQL Server and applies every script in `sql/` in alphabetical order, which is also the correct order:
 
 ```text
 sql/01_create_gold.sql        database, gold schema, dim_date, dim_time, fact

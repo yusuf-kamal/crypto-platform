@@ -195,7 +195,15 @@ docker run --rm python:3.12-slim python -c "import secrets,base64; print(base64.
 docker compose up -d
 ```
 
-The first run builds three images, and the Airflow one downloads about 280 MB of Spark jars from Maven -- most of it the single `aws-java-sdk-bundle` at 268 MB. Expect roughly ten minutes before anything starts; it is not hung.
+The first run builds three images, and the Airflow one downloads about 280 MB of Spark jars from Maven -- most of it the single `aws-java-sdk-bundle` at 268 MB. Expect ten minutes or so before anything starts; it is not hung. The `curl` calls retry and resume, so a dropped connection costs a pause rather than the whole build (it used to fail the layer with exit 18 and throw the ten minutes away).
+
+To get that download out of the way first -- on a slow link, or so the build is warm before you need it:
+
+```powershell
+bash scripts/prefetch.sh
+```
+
+It pulls every third-party image, builds the three local ones, retries each step, and finishes by checking that all nine jars are really in the Airflow image. Safe to re-run: Docker skips what it already has, and the script starts no container.
 
 The `mssql-init` service then waits for SQL Server and applies every script in `sql/` in alphabetical order, which is also the correct order:
 
@@ -311,6 +319,7 @@ docker/
   dbt/                         dbt image with the project baked in (ODBC)
   mssql/init.sh                applies sql/ once SQL Server is up
   streaming/                   small image for the WebSocket producer
+scripts/prefetch.sh            pulls images and builds, with retries, before the first start
 tests/                         PySpark + plain Python unit tests
 notebooks/                     exploration (outputs kept: they are the row counts quoted in section 4)
 docker-compose.yml
@@ -491,6 +500,7 @@ Stage timings of the final run: download + unzip 2.0 s, read + parse 24.7 s, qua
 | Spark `OutOfMemoryError` on large monthly files | Raised driver memory (3g to 6g) and the WSL memory limit; reduced scope to fit a 16 GB machine |
 | Silver writes very slow (6,000+ tiny files per month) | Diagnosed with per-stage timings, then committer v2 and repartition (section 10) |
 | SQL Server error 8645 (timeout waiting for memory) during `dbt run` | Host RAM was exhausted by the WSL VM; freed memory by shutting down WSL, added an index on the staging table |
+| The first real build died at the last layer with `exit code: 18` | curl's CURLE_PARTIAL_FILE: a dropped connection mid-download. `curl -fsSLO` does not retry a truncated transfer, so one interruption anywhere in 280 MB discarded the whole Airflow image -- ten and a half minutes of build, surfaced only as a BuildKit wall of text ending in a bare exit code. The jar URLs were all correct; it was transport, not coordinates. Fixed with `--retry-all-errors --continue-at -` plus a prefetch script |
 | Every streaming test failed with `AMBIGUOUS_REFERENCE: t` | Binance names the trade id `t` and the trade time `T`, and Spark resolves names case-insensitively, so a `from_json` struct holding both fields makes every reference to either one fail. Parsing with `get_json_object`, whose JSON paths are case-sensitive, fixes it without turning on `spark.sql.caseSensitive` session-wide |
 | dbt silently dropped the star schema's keys | sql/01 created `dim_symbol` and `fact_candles_1m`, but dbt materializes the same names: the first `--full-refresh` replaced them with constraint-free tables. The DDL now stops at the seeded dimensions and every key, foreign key and check is a dbt hook |
 | Airflow UI crash (React error #185) with several Airflow instances on `localhost` | Conflicting browser cookies; used `127.0.0.1` and stopped unrelated containers |

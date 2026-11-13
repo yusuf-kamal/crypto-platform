@@ -130,7 +130,7 @@ erDiagram
 | Source | Binance Public Data archive (`data.binance.vision`), spot monthly `aggTrades` |
 | Scope | BTCUSDT, ETHUSDT, BNBUSDT, SOLUSDT, XRPUSDT; months 2026-06 to 2026-10 (set in `src/common/config.py`) |
 | Gold fact rows | **1,101,600** (220,320 per symbol = 153 days x 1,440 minutes) |
-| Silver trade rows | **339,801,204** for the 5x5 scope. Derived from the per-(symbol, month) counts in `notebooks/01_explore_silver_and_candles.ipynb`, whose lake snapshot also held two 2026-05 files that are outside the final scope; the lake as measured there held 364,096,716 rows in total |
+| Silver trade rows | **339,801,204** for the 5x5 scope. Summed from the per-(symbol, month) counts kept in the outputs of `notebooks/01_explore_silver_and_candles.ipynb`; that snapshot of the lake also held two 2026-05 files (BTCUSDT and XRPUSDT) which are outside the final scope and are excluded here |
 | Silver rows per symbol (5x5 scope) | BTCUSDT 134,640,856 - ETHUSDT 113,395,176 - BNBUSDT 39,494,244 - XRPUSDT 27,584,014 - SOLUSDT 24,686,914 |
 
 Raw columns of an `aggTrades` file: aggregate trade id, price, quantity, first trade id, last trade id, transact time (microseconds in the 2026 files), is-buyer-maker, is-best-match. Files have no header.

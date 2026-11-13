@@ -105,3 +105,19 @@ def test_stream_candles_group_by_minute_and_symbol(spark):
     assert float(c.buy_volume) == 4.0
     assert float(c.sell_volume) == 2.0
     assert float(c.buy_volume) + float(c.sell_volume) == float(c.volume)
+
+
+def test_trade_id_and_trade_time_do_not_collide(spark):
+    # Regression test. Binance names the trade id `t` and the trade time `T`,
+    # and Spark resolves names case-insensitively: reading the payload with a
+    # from_json struct holding both made every reference fail with
+    # AMBIGUOUS_REFERENCE. The two values are deliberately far apart here, so
+    # a future refactor that reintroduces the collision -- or silently swaps
+    # the two fields -- fails on the values, not just on an exception.
+    df = parse_trade_events(kafka_frame(spark, [
+        event(trade_id=987654321, trade_ms=MINUTE + 1_000)
+    ]))
+    row = df.collect()[0]
+    assert row.trade_id == 987654321
+    assert row.trade_ms == MINUTE + 1_000
+    assert str(row.trade_ts) == "2025-12-01 00:00:01"

@@ -11,57 +11,56 @@ A raw combined-stream message looks like:
      "data": {"e": "trade", "E": 1700000000123, "s": "BTCUSDT",
               "t": 12345, "p": "0.001", "q": "100",
               "T": 1700000000120, "m": true, "M": true}}
+
+Note `t` (trade id) and `T` (trade time): see parse_trade_events for why that
+pair rules out the obvious `from_json` approach.
 """
 
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    BooleanType,
-    LongType,
-    StringType,
-    StructField,
-    StructType,
-)
 
-# Only the fields the warehouse needs; anything else in the payload is
-# ignored instead of failing, so Binance can add fields freely.
-TRADE_DATA_SCHEMA = StructType([
-    StructField("e", StringType(), True),    # event type
-    StructField("s", StringType(), True),    # symbol
-    StructField("t", LongType(), True),      # trade id
-    StructField("p", StringType(), True),    # price   (string in the payload)
-    StructField("q", StringType(), True),    # quantity(string in the payload)
-    StructField("T", LongType(), True),      # trade time, epoch milliseconds
-    StructField("m", BooleanType(), True),   # is the buyer the maker?
-])
-
-TRADE_EVENT_SCHEMA = StructType([
-    StructField("stream", StringType(), True),
-    StructField("data", TRADE_DATA_SCHEMA, True),
-])
+# JSON paths into the combined-stream message, with the type each value has
+# to be read as. Only the fields the warehouse needs are listed; anything
+# else Binance adds is ignored rather than breaking the parse.
+TRADE_FIELDS = {
+    "symbol": ("$.data.s", "string"),
+    "trade_id": ("$.data.t", "long"),
+    "price": ("$.data.p", "decimal(18,8)"),
+    "quantity": ("$.data.q", "decimal(18,8)"),
+    "trade_ms": ("$.data.T", "long"),
+    "is_buyer_maker": ("$.data.m", "boolean"),
+}
 
 
 def parse_trade_events(kafka_df: DataFrame) -> DataFrame:
     """Kafka `value` bytes -> flat, typed trade rows.
 
+    This uses `get_json_object` rather than `from_json` with a struct schema,
+    and the reason is the payload itself: Binance names the trade id `t` and
+    the trade time `T`. Spark resolves column and struct-field names
+    **case-insensitively** by default, so a struct holding both fields makes
+    every reference to either one fail with AMBIGUOUS_REFERENCE. JSON paths
+    are matched case-sensitively, which sidesteps the collision without
+    turning on `spark.sql.caseSensitive` for the whole session.
+
+    The cost is that the JSON is scanned once per field instead of once per
+    row. At this volume -- a few hundred messages a second across five
+    symbols -- that is not measurable, and the alternative is a global Spark
+    setting that would change behaviour far away from here.
+
     Prices and quantities arrive as strings and are cast to the same
     decimal(18,8) the batch Silver layer uses, so no floating-point error
     creeps in on the streaming side either.
     """
-    parsed = kafka_df.select(
-        F.from_json(F.col("value").cast("string"),
-                    TRADE_EVENT_SCHEMA).alias("msg")
-    ).select("msg.data.*")
+    value = F.col("value").cast("string")
+
+    parsed = kafka_df.select(*[
+        F.get_json_object(value, path).cast(sql_type).alias(name)
+        for name, (path, sql_type) in TRADE_FIELDS.items()
+    ])
 
     return (
-        parsed.select(
-            F.col("s").alias("symbol"),
-            F.col("t").cast("long").alias("trade_id"),
-            F.col("p").cast("decimal(18,8)").alias("price"),
-            F.col("q").cast("decimal(18,8)").alias("quantity"),
-            F.col("T").alias("trade_ms"),
-            F.col("m").alias("is_buyer_maker"),
-        )
+        parsed
         .withColumn("trade_ts", F.expr("timestamp_millis(trade_ms)"))
         # Same rule as the batch layer: if the buyer was the maker, the
         # aggressor was the seller.

@@ -12,15 +12,25 @@
 # Every script is idempotent, so re-running this service is harmless.
 set -eu
 
-# sqlcmd lives in a different place depending on the image and major version,
-# and only the 18 build knows -C (trust the server's self-signed certificate).
+# sqlcmd lives in a different place depending on the image and major version.
+# In mcr.microsoft.com/mssql/server:2022-latest it is at exactly one path,
+# /opt/mssql-tools18/bin/sqlcmd, and it is NOT on PATH -- verified against the
+# image, so that path is tried first.
+#
+# -C (trust the server certificate) is not optional with the 18 tools: driver
+# 18 defaults to Encrypt=yes and the container's certificate is self-signed,
+# so without it every call fails with
+#   SSL Provider: [error:0A000086:...:certificate verify failed:self-signed
+#   certificate] / Client unable to establish connection
+# which reads like a server that is not up yet, not like a TLS setting. The
+# pre-18 tools do not know the flag, hence the split.
 SQLCMD=""
 EXTRA=""
-if command -v sqlcmd >/dev/null 2>&1; then
-    SQLCMD="$(command -v sqlcmd)"
-    EXTRA="-C"
-elif [ -x /opt/mssql-tools18/bin/sqlcmd ]; then
+if [ -x /opt/mssql-tools18/bin/sqlcmd ]; then
     SQLCMD=/opt/mssql-tools18/bin/sqlcmd
+    EXTRA="-C"
+elif command -v sqlcmd >/dev/null 2>&1; then
+    SQLCMD="$(command -v sqlcmd)"
     EXTRA="-C"
 elif [ -x /opt/mssql-tools/bin/sqlcmd ]; then
     SQLCMD=/opt/mssql-tools/bin/sqlcmd

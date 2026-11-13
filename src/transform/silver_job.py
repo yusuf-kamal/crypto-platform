@@ -74,7 +74,7 @@ def run(symbol: str, month: str) -> dict:
         t = lap("dedupe_count_s", t)
         valid.repartition(F.col("trade_date")).write.mode("overwrite").partitionBy(
             "symbol", "trade_date").parquet(SILVER)
-        t = lap("write_valid_s", t)
+        lap("write_valid_s", t)
 
         tagged.unpersist()
         valid.unpersist()

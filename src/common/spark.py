@@ -16,6 +16,10 @@ JARS = (
     "/opt/spark-jars/delta-storage-3.2.0.jar"
 )
 
+# Must fit inside Docker Desktop's memory limit, with room for the OS and the
+# other containers. Section 5 of the README states the floor.
+DRIVER_MEMORY = os.environ.get("SPARK_DRIVER_MEMORY", "6g")
+
 # Delta ships as jars only here. The `delta-spark` pip package pins its own
 # PySpark version, which would fight the 3.5.1 the rest of the image is built
 # around, and nothing in this project needs the Python DeltaTable API.
@@ -30,7 +34,12 @@ def get_spark(app_name: str) -> SparkSession:
     builder = (
         SparkSession.builder.appName(app_name)
         .master("local[4]")
-        .config("spark.driver.memory", "6g")
+        # 6g is what one monthly aggTrades file needed on the development
+        # machine. It is an env var because it is the one setting that has to
+        # match the host: a driver larger than Docker's memory limit does not
+        # fail with a clear message, it just never starts. Lower it together
+        # with the scope in config.py on a smaller machine.
+        .config("spark.driver.memory", DRIVER_MEMORY)
         .config("spark.jars", JARS)
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.sources.partitionOverwriteMode", "dynamic")

@@ -154,7 +154,9 @@ Raw columns of an `aggTrades` file: aggregate trade id, price, quantity, first t
 
 ### Prerequisites
 
-- Windows 10/11 with Docker Desktop (WSL2 backend). Developed on a 16 GB machine with WSL limited to 10 GB (`.wslconfig`: `memory=10GB`, `swap=4GB`).
+- Docker Desktop. Developed on Windows 10/11 with the WSL2 backend on a 16 GB machine, WSL limited to 10 GB (`.wslconfig`: `memory=10GB`, `swap=4GB`). macOS works too, with the caveat below.
+- **At least 8 GB for Docker itself, 10 preferred.** `SPARK_DRIVER_MEMORY` defaults to `6g`, and a driver larger than the limit does not fail with a clear message -- it simply never starts. Check with `docker info` (`MemTotal`); Docker Desktop's own default is often 4 GB, which is not enough. Raise it under Settings -> Resources, or lower both `SPARK_DRIVER_MEMORY` and the scope in `src/common/config.py`.
+- **On Apple Silicon:** SQL Server publishes no arm64 image (the 2022 manifest is amd64-only), so it runs under emulation. `MSSQL_PLATFORM` is already pinned to `linux/amd64` in compose; you also have to switch on "Use Rosetta for x86/amd64 emulation" in Docker Desktop -> Settings -> General. Without it the container exits quietly and `mssql-init` waits for a server that never arrives. The object store (`pgsty/silo`) and Kafka are multi-arch and need nothing.
 - Free local ports: `8085` (Airflow UI), `9000`/`9001` (S3 API / console), `14330` (SQL Server), `8888` (Jupyter, optional).
 - No SQL Server installation on the host: it runs in Compose. To use a host instance instead, see [Limitations](#9-known-limitations).
 
@@ -177,6 +179,8 @@ Fill in `.env` (never commit it). The file lists every variable with a comment; 
 | `MSSQL_PASSWORD` | Password for `crypto_app`, the least-privilege login the pipeline uses |
 | `ALERT_WEBHOOK_URL` | Optional. Empty means failures are logged but not pushed anywhere |
 | `LAKE_FORMAT` | `delta` by default. Set it to `parquet` to fall back to the pre-Delta behaviour without touching a job |
+| `SPARK_DRIVER_MEMORY` | `6g` by default. Must fit inside the Docker memory limit |
+| `MSSQL_PLATFORM` | `linux/amd64`. Only change it if Microsoft ever ships an arm64 build |
 
 Generate each Airflow secret with:
 

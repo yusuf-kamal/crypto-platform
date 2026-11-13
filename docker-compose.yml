@@ -31,6 +31,8 @@ x-airflow-common: &airflow-common
     KAFKA_TOPIC: binance.trades
     # Silver layer format: delta (default) or parquet as a fallback.
     LAKE_FORMAT: ${LAKE_FORMAT:-delta}
+    # Keep in step with the Docker Desktop memory limit (see README step 1).
+    SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-6g}
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
@@ -51,6 +53,13 @@ services:
   # wait for it to finish.
   mssql:
     image: mcr.microsoft.com/mssql/server:2022-latest
+    # SQL Server ships amd64 only -- the 2022 manifest has no arm64 variant at
+    # all. On Apple Silicon the image therefore needs emulation, which means
+    # this line plus "Use Rosetta for x86/amd64 emulation" in Docker Desktop
+    # (Settings -> General). Without both, the container exits without a
+    # useful message and mssql-init then waits for a server that never comes.
+    # On an amd64 host the line is a no-op.
+    platform: ${MSSQL_PLATFORM:-linux/amd64}
     container_name: mssql
     environment:
       ACCEPT_EULA: "Y"
@@ -63,6 +72,7 @@ services:
 
   mssql-init:
     image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: ${MSSQL_PLATFORM:-linux/amd64}
     container_name: mssql-init
     depends_on:
       - mssql

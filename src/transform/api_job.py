@@ -26,6 +26,7 @@ from pyspark.sql.types import (
 )
 
 from src.common.config import COINGECKO_IDS
+from src.common.observability import json_log, write_run_metrics
 from src.common.spark import get_spark
 from src.transform.api_daily import (
     fear_greed_rows,
@@ -149,7 +150,17 @@ def run(ds: str) -> dict:
         "fear_greed_rows_rejected": len(fng_rejected),
         "seconds": round(time.time() - started, 1),
     }
-    print(json.dumps(metrics))
+    json_log("api_daily_built", **metrics)
+    write_run_metrics(spark, "api", [
+        {"entity": "coingecko_market_chart", "status": "processed",
+         "rows_valid": len(market_valid),
+         "rows_rejected": len(market_rejected),
+         "seconds": metrics["seconds"], "details": {"ds": ds}},
+        {"entity": "alternative_me_fear_greed", "status": "processed",
+         "rows_valid": len(fng_valid),
+         "rows_rejected": len(fng_rejected),
+         "seconds": metrics["seconds"], "details": {"ds": ds}},
+    ])
     return metrics
 
 

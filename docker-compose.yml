@@ -1,3 +1,7 @@
+# Fixed project name, so the Docker network the dbt container joins is
+# predictable (crypto-platform_default) for the dbt_build DAG.
+name: crypto-platform
+
 x-airflow-common: &airflow-common
   build: ./docker/airflow
   image: crypto-airflow:1.0
@@ -19,15 +23,57 @@ x-airflow-common: &airflow-common
     MSSQL_DB: ${MSSQL_DB}
     MSSQL_USER: ${MSSQL_USER}
     MSSQL_PASSWORD: ${MSSQL_PASSWORD}
+    DBT_IMAGE: crypto-dbt:1.0
+    DOCKER_NETWORK: crypto-platform_default
+    # Optional: a Slack-style incoming webhook. Empty means log-only alerts.
+    ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+    KAFKA_BOOTSTRAP: kafka:9092
+    KAFKA_TOPIC: binance.trades
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
     - ./src:/opt/airflow/src
     - ./tests:/opt/airflow/tests
+    # The dbt_build DAG starts the dbt container through this socket.
+    # It gives the Airflow containers control over the host Docker daemon,
+    # which is acceptable for a local, single-user setup only.
+    - /var/run/docker.sock:/var/run/docker.sock
   depends_on:
     postgres:
       condition: service_healthy
+    mssql-init:
+      condition: service_completed_successfully
 services:
+  # The warehouse now runs in Compose, so `docker compose up -d` is the whole
+  # setup: mssql-init applies every script in sql/ and the Airflow services
+  # wait for it to finish.
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: mssql
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+      MSSQL_PID: Developer
+    ports:
+      - "${MSSQL_HOST_PORT:-14330}:1433"
+    volumes:
+      - mssql_data:/var/opt/mssql
+
+  mssql-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: mssql-init
+    depends_on:
+      - mssql
+    environment:
+      MSSQL_HOST: mssql
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+      MSSQL_PASSWORD: ${MSSQL_PASSWORD}
+    entrypoint: ["/bin/sh", "/init/init.sh"]
+    volumes:
+      - ./sql:/sql:ro
+      - ./docker/mssql:/init:ro
+    restart: "no"
+
   minio:
     image: docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z
     container_name: minio
@@ -140,7 +186,9 @@ services:
       - ./notebooks:/opt/airflow/notebooks 
 
   dbt:
-    build: ./docker/dbt
+    build:
+      context: .
+      dockerfile: docker/dbt/Dockerfile
     image: crypto-dbt:1.0
     profiles: ["tools"]
     entrypoint: ["dbt"]
@@ -154,6 +202,64 @@ services:
       MSSQL_PASSWORD: ${MSSQL_PASSWORD}
     volumes:
       - ./dbt:/app/dbt           
+
+  # --- Streaming path (profile: streaming) -------------------------------
+  # Kept behind a profile because it is a long-running path, not a scheduled
+  # one: `docker compose --profile streaming up -d`.
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: kafka
+    profiles: ["streaming"]
+    environment:
+      CLUSTER_ID: crypto-platform-kraft-01
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # Single broker, so every replication factor has to be 1.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # A laptop-sized buffer: the topic is a hand-off, not the archive.
+      KAFKA_LOG_RETENTION_HOURS: 24
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+  trade-producer:
+    build:
+      context: .
+      dockerfile: docker/streaming/Dockerfile
+    image: crypto-streaming:1.0
+    container_name: trade-producer
+    profiles: ["streaming"]
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC: binance.trades
+    restart: unless-stopped
+
+  trade-consumer:
+    <<: *airflow-common
+    container_name: trade-consumer
+    profiles: ["streaming"]
+    # The Airflow entrypoint prepends `airflow` to an unknown command, so the
+    # job is started as a module, the same trick the jupyter service uses.
+    command:
+      - python
+      - -m
+      - src.streaming.trades_stream_job
+    restart: unless-stopped
+
 volumes:
+  mssql_data:
+  kafka_data:
   minio_data:
   postgres_data:

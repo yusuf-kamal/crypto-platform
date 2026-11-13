@@ -5,7 +5,12 @@ from datetime import datetime, timedelta
 
 from airflow.sdk import dag, task
 
-from src.common.assets import BRONZE_API_DAILY, SILVER_API_DAILY
+from src.common.observability import on_failure_alert
+from src.common.assets import (
+    BRONZE_API_DAILY,
+    SILVER_API_DAILY,
+    WAREHOUSE_STAGING,
+)
 
 log = logging.getLogger("airflow.task")
 
@@ -17,10 +22,11 @@ log = logging.getLogger("airflow.task")
     catchup=False,
     max_active_runs=1,
     tags=["silver", "gold", "api"],
-    default_args={"retries": 1, "retry_delay": timedelta(minutes=2)},
+    default_args={"on_failure_callback": on_failure_alert,
+                  "retries": 1, "retry_delay": timedelta(minutes=2)},
 )
 def api_daily_warehouse():
-    @task(outlets=[SILVER_API_DAILY])
+    @task(outlets=[SILVER_API_DAILY, WAREHOUSE_STAGING])
     def build(ds: str) -> dict:
         from src.transform.api_job import run
 

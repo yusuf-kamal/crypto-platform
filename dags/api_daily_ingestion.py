@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 
 from airflow.sdk import dag, task
 
+from src.common.observability import on_failure_alert
 from src.common.assets import BRONZE_API_DAILY
 from src.common.config import COINGECKO_DAYS, COINGECKO_IDS, FEAR_GREED_LIMIT
 
@@ -27,7 +28,8 @@ CONN_ID = "minio_s3"
     catchup=False,
     max_active_runs=1,
     tags=["bronze", "api"],
-    default_args={"retries": 3, "retry_delay": timedelta(minutes=5)},
+    default_args={"on_failure_callback": on_failure_alert,
+                  "retries": 3, "retry_delay": timedelta(minutes=5)},
 )
 def api_daily_ingestion():
     @task

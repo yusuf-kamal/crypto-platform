@@ -17,3 +17,11 @@ BRONZE_API_DAILY = Asset(
 SILVER_API_DAILY = Asset(
     name="silver_api_daily", uri="s3://silver/api_daily"
 )
+
+# --- Warehouse ---
+# Published by whichever DAG finished loading a staging table. Both the
+# Binance Gold DAG and the API DAG update it, so dbt_build runs after either
+# one; a single shared Asset keeps that an OR instead of an AND.
+WAREHOUSE_STAGING = Asset(
+    name="warehouse_staging", uri="mssql://CryptoDWH/staging"
+)

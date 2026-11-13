@@ -2,59 +2,123 @@ version: 2
 
 models:
   - name: dim_symbol
+    description: >
+      One row per traded symbol, with a surrogate integer key. Built from the
+      symbols that actually appear in staging, so a new symbol in the config
+      flows into the warehouse without a manual insert.
     columns:
       - name: symbol_key
+        description: Surrogate key. Small integer joins on a 1.1 M-row fact.
         tests: [unique, not_null]
       - name: symbol
+        description: Binance trading pair, e.g. BTCUSDT.
         tests: [unique, not_null]
+      - name: base_asset
+        description: The traded asset, derived from the pair (BTC in BTCUSDT).
+      - name: quote_asset
+        description: The pricing asset. Always USDT in the current scope.
 
   - name: fact_candles_1m
+    description: >
+      One row per symbol per minute, aggregated from every individual trade in
+      the Silver lake. About 1/400 of the trade count, which is what keeps SQL
+      Server and BI queries fast without losing detail: the trades themselves
+      stay in the lake. All timestamps are UTC.
     columns:
       - name: date_key
+        description: "Readable date key, e.g. 20261031."
         tests:
           - not_null
           - relationships:
               to: source('gold_seed', 'dim_date')
               field: date_key
       - name: time_key
+        description: "Readable minute-of-day key, e.g. 1435 for 14:35."
         tests:
           - not_null
           - relationships:
               to: source('gold_seed', 'dim_time')
               field: time_key
       - name: symbol_key
+        description: Foreign key to dim_symbol.
         tests:
           - not_null
           - relationships:
               to: ref('dim_symbol')
               field: symbol_key
+      - name: open_price
+        description: Price of the first trade of the minute, by aggregate trade id.
+      - name: high_price
+        description: Highest trade price in the minute.
+      - name: low_price
+        description: Lowest trade price in the minute.
+      - name: close_price
+        description: Price of the last trade of the minute, by aggregate trade id.
+      - name: volume
+        description: Base-asset quantity traded in the minute.
+      - name: quote_volume
+        description: Quote-asset value traded (sum of price x quantity).
       - name: trade_count
+        description: Number of aggregate trades in the minute.
         tests: [not_null]
+      - name: buy_volume
+        description: >
+          Quantity where the buyer was the aggressor. buy_volume +
+          sell_volume equals volume.
+      - name: sell_volume
+        description: Quantity where the seller was the aggressor.
+      - name: loaded_at
+        description: UTC timestamp of the dbt run that wrote the row.
+
   - name: fact_coin_market_daily
-    description: Daily price, market cap and 24h volume per symbol (CoinGecko).
+    description: >
+      Daily market context per symbol from CoinGecko (source type 2). Joins
+      the same dim_symbol and dim_date as the candle fact, so one query can
+      put minute-level trading activity next to that day's market cap.
     columns:
       - name: date_key
+        description: Foreign key to dim_date.
         tests:
           - not_null
           - relationships:
               to: source('gold_seed', 'dim_date')
               field: date_key
       - name: symbol_key
+        description: Foreign key to dim_symbol.
         tests:
           - not_null
           - relationships:
               to: ref('dim_symbol')
               field: symbol_key
+      - name: price_usd
+        description: CoinGecko's daily USD price for the coin.
+      - name: market_cap_usd
+        description: >
+          Market capitalisation in USD. Nullable: CoinGecko omits it
+          occasionally, and the row is kept for the sake of the price.
+      - name: total_volume_usd
+        description: Reported 24h trading volume in USD, across all venues. Nullable.
+      - name: loaded_at
+        description: UTC timestamp of the dbt run that wrote the row.
 
   - name: fact_fear_greed_daily
-    description: Daily market-wide Fear & Greed index (alternative.me).
+    description: >
+      Daily crypto Fear & Greed index from alternative.me (source type 2).
+      Market-wide rather than per symbol, which is why it is its own fact
+      instead of a column on fact_coin_market_daily.
     columns:
       - name: date_key
+        description: Foreign key to dim_date. One row per day.
         tests:
           - unique
           - not_null
           - relationships:
               to: source('gold_seed', 'dim_date')
               field: date_key
+      - name: fng_value
+        description: The index on a 0-100 scale. 0 is extreme fear, 100 extreme greed.
       - name: fng_classification
+        description: "The published label for that value, e.g. Extreme Fear."
         tests: [not_null]
+      - name: loaded_at
+        description: UTC timestamp of the dbt run that wrote the row.

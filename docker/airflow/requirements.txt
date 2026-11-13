@@ -5,6 +5,8 @@
 # and then install from that file instead.
 apache-airflow-providers-amazon
 apache-airflow-providers-postgres
+# Lets the dbt_build DAG run the dbt image through the host Docker socket.
+apache-airflow-providers-docker
 requests
 pyspark==3.5.1
 jupyterlab

@@ -23,21 +23,22 @@ Raw Binance trade files are huge (tens of millions of rows per symbol per month)
 | Area | State |
 |---|---|
 | Batch ingestion from Binance public archive (5 symbols x 5 months = 25 files) | Done |
+| Second source type: CoinGecko API + Fear & Greed Index API (daily grain) | Done |
+| Streaming source (Binance WebSocket -> Kafka -> Spark Structured Streaming) | Code complete, not yet run against the live stream |
 | Data lake with Bronze / Silver / Gold buckets (S3-compatible) | Done |
 | Silver: Spark typing, cleaning, de-duplication, quarantine | Done |
 | Warehouse: SQL Server star schema, dbt incremental models | Done |
-| Data quality: 35 Python unit tests, 24 dbt tests | Done (the 13 candle-path dbt tests are verified; the 11 API tests have not been run yet) |
-| Orchestration: 3 Airflow DAGs chained with Assets | Done |
+| Data quality: 50 Python unit tests, 24 dbt tests | Done (the 13 candle-path dbt tests are verified; the 11 API tests have not been run yet) |
+| Orchestration: 6 Airflow DAGs chained with Assets | Done |
+| Airflow task that runs dbt (run, test, docs generate) | Done |
+| Gold recomputes only newly processed Silver files | Done |
+| Structured logging, run-metrics table, failure alerts | Done (webhook alerting is opt-in through ALERT_WEBHOOK_URL) |
+| Lineage / data catalog (`dbt docs generate`) | Done |
+| Run the whole platform with `docker compose up -d`, SQL Server included | Done |
 | Performance tuning with before/after measurements | Done (Silver write path) |
-| Run the platform with Docker Compose | Partly (SQL Server runs natively, see [Limitations](#9-known-limitations)) |
-| Streaming source (Binance WebSocket → Kafka → Spark Structured Streaming) | Planned |
-| Second source type: CoinGecko API + Fear & Greed Index API (daily grain) | Done |
-| Airflow task that runs dbt (today dbt is run manually through a compose profile) | Planned |
+| GitHub Actions CI (ruff lint + Python unit tests on every push) | Done |
 | Power BI dashboard on the Gold layer | Planned |
-| Structured logging, metrics table, failure alerts | Planned |
-| GitHub Actions CI (ruff lint + PySpark unit tests on every push) | Done |
-| Unit tests for the Gold candle function (7 tests) | Done |
-| Lineage / data catalog (`dbt docs`), Delta Lake or Iceberg, CDC, Terraform | Not started |
+| Delta Lake or Iceberg, CDC, Terraform | Not started |
 
 ---
 
@@ -51,12 +52,16 @@ flowchart LR
     C --> Q[(Quarantine<br/>rejected rows + reason)]
     D -->|Asset| E[binance_gold<br/>Spark: 1-minute candles]
     E --> F[(SQL Server<br/>staging.candles_1m)]
-    F -->|dbt incremental| G[(SQL Server gold<br/>star schema)]
+    F -->|Asset| N[dbt_build<br/>run / test / docs]
+    N --> G[(SQL Server gold<br/>star schema)]
     I[CoinGecko API<br/>Fear & Greed API] -->|api_daily_ingestion| J[(Bronze<br/>raw JSON per day)]
     J -->|Asset| K[api_daily_warehouse<br/>parse + validate]
     K --> L[(Silver<br/>daily Parquet)]
     K --> M[(SQL Server<br/>staging.coin_market_daily<br/>staging.fear_greed_daily)]
-    M -->|dbt incremental| G
+    M -->|Asset| N
+    S[Binance WebSocket<br/>live trades] -->|trade-producer| T[(Kafka<br/>binance.trades)]
+    T -->|Structured Streaming| U[trade-consumer<br/>1-minute windows]
+    U --> V[(Silver<br/>stream_candles_1m)]
     G -.->|planned| H[Power BI]
 ```
 
@@ -138,8 +143,8 @@ Raw columns of an `aggTrades` file: aggregate trade id, price, quantity, first t
 ### Prerequisites
 
 - Windows 10/11 with Docker Desktop (WSL2 backend). Developed on a 16 GB machine with WSL limited to 10 GB (`.wslconfig`: `memory=10GB`, `swap=4GB`).
-- A SQL Server instance on the host machine with TCP/IP enabled on a fixed port (developed with port `14330`) and SQL authentication allowed.
-- Free local ports: `8085` (Airflow UI), `9000`/`9001` (S3 API / console), `8888` (Jupyter, optional).
+- Free local ports: `8085` (Airflow UI), `9000`/`9001` (S3 API / console), `14330` (SQL Server), `8888` (Jupyter, optional).
+- No SQL Server installation on the host: it runs in Compose. To use a host instance instead, see [Limitations](#9-known-limitations).
 
 ### Steps
 
@@ -149,14 +154,16 @@ Raw columns of an `aggTrades` file: aggregate trade id, price, quantity, first t
 copy .env.example .env
 ```
 
-Fill in `.env` (never commit it):
+Fill in `.env` (never commit it). The file lists every variable with a comment; the ones that need a value from you:
 
 | Variable | Purpose |
 |---|---|
 | `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD` | Object storage credentials |
-| `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | Airflow metadata database |
+| `POSTGRES_USER`, `POSTGRES_PASSWORD` | Airflow metadata database |
 | `AIRFLOW_FERNET_KEY`, `AIRFLOW_JWT_SECRET` | Airflow secrets (see below) |
-| `MSSQL_HOST` (`host.docker.internal`), `MSSQL_PORT`, `MSSQL_DB` (`CryptoDWH`), `MSSQL_USER`, `MSSQL_PASSWORD` | Warehouse connection |
+| `MSSQL_SA_PASSWORD` | SQL Server `sa` password, used only by `mssql-init` |
+| `MSSQL_PASSWORD` | Password for `crypto_app`, the least-privilege login the pipeline uses |
+| `ALERT_WEBHOOK_URL` | Optional. Empty means failures are logged but not pushed anywhere |
 
 Generate each Airflow secret with:
 
@@ -164,70 +171,68 @@ Generate each Airflow secret with:
 docker run --rm python:3.12-slim python -c "import secrets,base64; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())"
 ```
 
-**2. Prepare SQL Server** (run in SSMS with an admin login, in this order)
-
-```text
-sql/01_create_gold.sql      -- database, gold schema, dim_date, dim_time
-sql/02_seed_dims.sql        -- fills dim_date (2026-2027) and dim_time (1,440 rows)
-sql/03_create_staging.sql   -- staging.candles_1m
-sql/04_create_api_staging.sql -- API staging tables + dim_date top-up for 2025
-```
-
-Then create the least-privilege login used by Spark and dbt:
-
-```sql
-USE master;
-CREATE LOGIN crypto_app WITH PASSWORD = '<your password>', CHECK_POLICY = OFF;
-GO
-USE CryptoDWH;
-CREATE USER crypto_app FOR LOGIN crypto_app;
-ALTER ROLE db_datareader ADD MEMBER crypto_app;
-ALTER ROLE db_datawriter ADD MEMBER crypto_app;
-GRANT CREATE TABLE, CREATE VIEW TO crypto_app;
-GRANT ALTER ON SCHEMA::gold TO crypto_app;
-GRANT SELECT, INSERT, DELETE, ALTER ON SCHEMA::staging TO crypto_app;
-GO
-```
-
-Allow the container to reach the host port (run PowerShell as Administrator; consider `-Profile Private`):
-
-```powershell
-New-NetFirewallRule -DisplayName "SQL Server 14330" -Direction Inbound -Protocol TCP -LocalPort 14330 -Action Allow
-```
-
-**3. Start the platform**
+**2. Start the platform**
 
 ```powershell
 docker compose up -d
 ```
 
+That is the whole setup. The `mssql-init` service waits for SQL Server, then applies every script in `sql/` in alphabetical order, which is also the correct order:
+
+```text
+sql/01_create_gold.sql        database, gold schema, dim_date, dim_time, fact
+sql/01b_create_login.sql      the crypto_app login, before anything grants to it
+sql/02_seed_dims.sql          dim_date (2025-2027) and dim_time (1,440 rows)
+sql/03_create_staging.sql     staging.candles_1m
+sql/04_create_api_staging.sql API staging tables + dim_date top-up for 2025
+sql/05_create_ops.sql         ops.pipeline_runs (run metrics)
+```
+
+Every script is idempotent, so re-running the service changes nothing. The Airflow services wait for it to finish before they start.
+
 - Airflow UI: <http://127.0.0.1:8085> (no login, local use only)
 - Object storage console: <http://localhost:9001>
+- SQL Server: `localhost,14330`, login `crypto_app` (or `sa` for admin work)
 
-**4. Run the pipeline**
+**3. Run the batch pipeline**
 
-The API source is independent of the Binance path: trigger `api_daily_ingestion` (or let its daily schedule do it) and `api_daily_warehouse` starts automatically through its Asset.
+Trigger `binance_batch_ingestion` in the Airflow UI. When it finishes, `binance_silver` starts automatically (Asset), then `binance_gold`, then `dbt_build` (`dbt run`, `dbt test`, `dbt docs generate`).
 
-Trigger `binance_batch_ingestion` in the Airflow UI. When it finishes, `binance_silver` starts automatically (Asset), and when that finishes `binance_gold` starts automatically.
+`binance_gold` is incremental: it only turns Silver files into candles that it has not processed before. To recompute the whole scope, trigger it with the config `{"full_refresh": true}`.
 
-**5. Build and test the warehouse models**
+**4. Run the API pipeline**
+
+Independent of the Binance path. Trigger `api_daily_ingestion` (or let its `@daily` schedule do it); `api_daily_warehouse` follows through its Asset and also publishes the staging Asset, so `dbt_build` runs afterwards.
+
+**5. Optional: the streaming path**
+
+```powershell
+docker compose --profile streaming up -d
+```
+
+This starts Kafka, the WebSocket producer (`trade-producer`) and the Spark Structured Streaming consumer (`trade-consumer`). Live 1-minute candles appear under `s3a://silver/stream_candles_1m`, partitioned by symbol, and a candle is only written once its minute is closed by the watermark. Stop it with `docker compose --profile streaming down`.
+
+The streaming candles stay in their own prefix on purpose: the batch layer is complete and reproducible, while the stream only covers the time the consumer was running.
+
+**6. Optional: run dbt by hand, exploration notebook, tests**
 
 ```powershell
 docker compose --profile tools run --rm dbt run
-docker compose --profile tools run --rm dbt test
 ```
 
-**Optional: exploration notebook**
+```powershell
+docker compose --profile tools run --rm dbt test
+```
 
 ```powershell
 docker compose --profile dev up -d jupyter    # http://localhost:8888
 ```
 
-Run the PySpark unit tests inside the Airflow image:
-
 ```powershell
 docker compose exec airflow-scheduler python -m pytest tests -q
 ```
+
+The compose `dbt` service bind-mounts `./dbt`, so `docs generate` through it writes `dbt/target/` on the host, which `dbt docs serve` can then open. The Airflow DAG runs the same image with the project baked in and keeps its artefacts in the `dbt_target` volume.
 
 ---
 
@@ -237,31 +242,44 @@ docker compose exec airflow-scheduler python -m pytest tests -q
 dags/
   binance_batch_ingestion.py   Bronze: download, checksum-verify, upload
   binance_silver.py            Silver: one Spark task per (symbol, month)
-  binance_gold.py              Gold: candles -> SQL Server staging
+  binance_gold.py              Gold: candles -> staging, incremental
   api_daily_ingestion.py       Bronze: CoinGecko + Fear & Greed JSON, one file per day
   api_daily_warehouse.py       Silver + staging for the API source
+  dbt_build.py                 dbt run / test / docs generate, in the dbt container
 src/
-  common/                      config, Airflow Assets, Spark session factory
+  common/
+    config.py                  symbols, months, coin ids, lookback
+    assets.py                  the Airflow Assets that chain the DAGs
+    spark.py                   Spark session factory (S3A, JDBC, Kafka jars)
+    observability.py           structured logging, run metrics, failure alerts
+  ingestion/
+    api_sources.py             HTTP access to both public REST APIs
   transform/
     silver_aggtrades.py        pure transformation functions (no I/O)
     silver_job.py              Silver I/O + metrics
     gold_candles.py            1-minute candle aggregation (pure)
-    gold_job.py                reads Silver, writes staging via JDBC
-    api_daily.py               API JSON -> daily rows (pure)
+    gold_job.py                reads Silver, writes staging via JDBC, incremental
+    api_daily.py               API JSON -> daily rows + quality gate (pure)
     api_job.py                 API Silver + staging
-  ingestion/
-    api_sources.py             HTTP access to both public REST APIs
-dbt/                           dim_symbol, 3 fact models, tests
-sql/                           DDL and dimension seed scripts
-docker/                        Airflow image (Java, PySpark, JDBC) and dbt image (ODBC)
+  streaming/
+    trade_events.py            Kafka JSON -> typed trades -> candles (pure)
+    binance_ws_producer.py     Binance WebSocket -> Kafka (long-running)
+    trades_stream_job.py       Structured Streaming: Kafka -> Silver
+dbt/                           dim_symbol, 3 fact models, 24 tests, descriptions
+sql/                           DDL, dimension seeds, login, ops table
+docker/
+  airflow/                     Airflow image (Java, PySpark, JDBC + Kafka jars)
+  dbt/                         dbt image with the project baked in (ODBC)
+  mssql/init.sh                applies sql/ once SQL Server is up
+  streaming/                   small image for the WebSocket producer
 tests/                         PySpark + plain Python unit tests
 notebooks/                     exploration (outputs cleared)
 docker-compose.yml
 pyproject.toml                 ruff + pytest configuration
-.github/workflows/ci.yml       CI: ruff lint + PySpark unit tests
+.github/workflows/ci.yml       CI: ruff lint + Python unit tests
 ```
 
-Compose services: object storage + bucket init, Postgres (Airflow metadata), Airflow (api-server, scheduler, dag-processor, triggerer, init). Optional profiles: `dev` (Jupyter) and `tools` (dbt).
+Compose services, always on: SQL Server + its init job, object storage + bucket init, Postgres (Airflow metadata), Airflow (api-server, scheduler, dag-processor, triggerer, init). Optional profiles: `dev` (Jupyter), `tools` (dbt on demand) and `streaming` (Kafka, producer, consumer).
 
 ---
 
@@ -285,6 +303,14 @@ Compose services: object storage + bucket init, Postgres (Airflow metadata), Air
 | **Two separate API facts instead of one** | `fact_coin_market_daily` is per symbol, `fact_fear_greed_daily` is market-wide. Putting the index on the per-symbol fact would repeat it five times a day | One wide daily fact |
 | **Raw JSON kept untouched in Bronze** | Same reason as the Binance zip: a schema change at the API never costs us the payload we already fetched | Parse on ingestion |
 | **API amounts stored as DECIMAL, carried as double** | The values arrive as JSON floats, so they were never exact; the warehouse column is DECIMAL so arithmetic matches the candle fact | Decimal end to end (false precision) |
+| **The streaming path writes its own Silver prefix** | The batch layer is complete and reproducible; the stream is fresh but only covers the uptime of the consumer. One table holding both would be neither | Appending stream candles into the batch fact |
+| **A long-running Compose service for the stream, not an Airflow task** | Airflow schedules work that ends. An unbounded query would hold a task slot forever and its retries would mean nothing | A continuously triggered DAG, a sensor loop |
+| **The producer forwards raw messages and parses nothing** | Same reason Bronze keeps the untouched zip: if the payload changes, the data is already in the topic and can be reparsed | Parse and validate in the producer |
+| **Kafka messages keyed by symbol** | Keeps per-symbol ordering inside a partition, which the open/close-by-trade-id logic depends on | No key (round-robin) |
+| **dbt orchestrated through the Docker socket** | dbt needs Python 3.11 and Airflow runs 3.13, so it cannot be imported. Starting its image keeps that split and still puts dbt under orchestration | dbt inside the Airflow image, Cosmos, a bash `docker exec` |
+| **SQL Server inside Compose** | `docker compose up -d` becomes the entire setup, and `mssql-init` replaces a page of manual SSMS steps | A host installation (what the project started with) |
+| **Gold tracks its own processed pairs in object storage** | The Silver manifests already say what exists; a small JSON of what Gold consumed turns that into a watermark without adding a database | A column in SQL Server, Airflow XCom, reprocessing everything |
+| **Metrics written by the jobs, not by Airflow** | The job is the only place that knows row counts and per-stage timings; Airflow only knows that a task ended | Parsing task logs, a separate collector |
 
 ---
 
@@ -322,27 +348,43 @@ Compose services: object storage + bucket init, Postgres (Airflow metadata), Air
   A missing `market_cap_usd` or `total_volume_usd` is deliberately **not** a reject: CoinGecko omits them now and then, and dropping the row would throw away that day's valid price too. Those columns carry nulls into the fact instead.
 - `dim_date` is topped up back to 2025 by `sql/04`, because the fact models join it with an inner join and a missing day would otherwise vanish without an error. `assert_api_facts_cover_staging` fails if that ever happens.
 
+### Streaming (Spark Structured Streaming)
+
+- The same typing and `side` rules as the batch Silver layer, so a streamed candle and a batch candle are comparable.
+- There is no quarantine: a stream has no file to replay, and failing an unbounded query over one malformed message would lose live data. `from_json` turns an unparseable message into nulls and `valid_trades()` drops it; the counts show up in the query's progress metrics.
+- The **watermark** (2 minutes by default) is what bounds the state: Spark closes a minute and forgets it once no trade that could still belong to it can arrive. Append mode then writes that candle exactly once, so a published Parquet file is never rewritten.
+- The checkpoint holds the Kafka offsets and the open window state, which is what makes a restart pick up where it stopped instead of double-counting.
+
+### Observability
+
+- Every job emits one structured JSON line per event through `json_log()`, with a fixed envelope (`ts`, `event`, then the fields).
+- Each job also appends a row per processed entity to `ops.pipeline_runs` (layer, entity, status, row counts, seconds, the job's own metrics as JSON). A metrics write that fails is logged and swallowed: observability must never fail the pipeline.
+- Every DAG carries an `on_failure_callback` that logs the failure as a structured event and, if `ALERT_WEBHOOK_URL` is set, posts a short message to it. A webhook that cannot be reached must not mask the real error, so that failure is logged too.
+
 ### Re-running safely
 
 | Layer | Mechanism |
 |---|---|
-| Bronze | Existing object keys are skipped; downloads are checksum-verified; 3 retries |
+| Bronze (files) | Existing object keys are skipped; downloads are checksum-verified; 3 retries |
+| Bronze (APIs) | The raw JSON is written under the run's logical date, so a re-run replaces its own day only |
 | Silver | Per-file manifest; Parquet written with dynamic partition overwrite |
-| Staging | Rebuilt on every Gold run (`truncate` + load) |
-| Gold | dbt incremental models merge on the fact's composite key, so a repeated batch does not duplicate rows |
+| Gold | Processes only the (symbol, month) pairs not in its own watermark file; `full_refresh` recomputes everything |
+| Staging | Rebuilt on every run (`truncate` + load); it holds the current batch, never history |
+| Warehouse | dbt incremental models merge on each fact's composite key, so a repeated batch does not duplicate rows |
+| Stream | Kafka offsets and window state live in the checkpoint; append mode publishes each closed minute once |
 
 ---
 
 ## 9. Known limitations
 
-- **Not yet a single-command start.** SQL Server runs natively on the host, so the SQL setup in step 2 is manual. A SQL Server container with an init service is the planned fix.
-- The Gold Spark job recomputes the whole configured scope on every run instead of only newly processed files.
-- dbt is not yet orchestrated by Airflow.
-- Two source types are implemented (Binance archive files, two REST APIs); streaming is still planned.
-- `trustServerCertificate=true` / `trust_cert: true` is used for the local SQL Server's self-signed certificate. Do not use it in production.
+- The streaming path is **code complete but has not been run against the live Binance stream**, so its numbers and failure modes are untested. The same holds for the dbt tests on the two API facts.
+- The whole platform is still single-node: Spark runs `local[4]`, Kafka is one broker with replication factor 1, and SQL Server is one container. Nothing here survives a machine failure.
+- `dbt_build` reaches the Docker daemon through the mounted socket. That gives the Airflow containers full control of the host's Docker, which is fine for a single-user local setup and would not be acceptable anywhere else.
+- `trustServerCertificate=true` / `trust_cert: true` is used for SQL Server's self-signed certificate. Do not use it in production.
 - Airflow runs without a login and Jupyter without a token; both are bound for local use only.
+- To use a SQL Server on the host instead of the container, set `MSSQL_HOST=host.docker.internal` and its port in `.env`, stop the `mssql` service, and apply `sql/` by hand in SSMS (in the order listed in step 2). The firewall rule is then also needed: `New-NetFirewallRule -DisplayName "SQL Server 14330" -Direction Inbound -Protocol TCP -LocalPort 14330 -Action Allow`.
 - Committer algorithm v2 (below) is faster but can leave partial files if a job dies mid-write; jobs are re-run with overwrite, which repairs this.
-- Performance numbers below are single runs on one laptop, not averaged benchmarks.
+- Performance numbers below are single runs on one laptop, not averaged benchmarks, and none of them cover the streaming path.
 
 ---
 
@@ -393,16 +435,19 @@ Stage timings of the final run: download + unzip 2.0 s, read + parse 24.7 s, qua
 
 ## 12. Security notes
 
-- Secrets live only in `.env` (git-ignored); `.env.example` lists variable names only.
+- Secrets live only in `.env` (git-ignored); `.env.example` lists variable names with comments and no values.
 - The pipeline uses a least-privilege SQL login (`crypto_app`), not `sa` or `db_owner`.
 - The Jupyter port is bound to `127.0.0.1`.
-- Remove the firewall rule when it is not needed: `Remove-NetFirewallRule -DisplayName "SQL Server 14330"`.
+- `sa` is used by the `mssql-init` service only, to create the database and the `crypto_app` login. Nothing in the pipeline connects as `sa`.
+- `dbt_build` mounts the host Docker socket into the Airflow containers, which effectively grants them root on the host. Acceptable for a local single-user setup, not beyond it; a Kubernetes or Celery setup would use a proper executor instead.
+- Kafka listens on PLAINTEXT with no authentication. It is only reachable inside the Compose network -- no port is published to the host.
+- If a SQL Server on the host is used instead of the container, remove the firewall rule when it is not needed: `Remove-NetFirewallRule -DisplayName "SQL Server 14330"`.
 
 ---
 
 ## 13. Versions
 
-Airflow 3.3.2 (Python 3.13) · PySpark 3.5.1 · Java 17 · hadoop-aws 3.3.4 · Microsoft JDBC driver 13.4.0 (jre11) · Postgres 16 · dbt-core 1.12.6 · dbt-sqlserver 1.12.1 · pyodbc 5.3.0 · ODBC Driver 18 for SQL Server · `pgsty/silo` RELEASE.2026-09-16T00-00-00Z
+Airflow 3.3.2 (Python 3.13) · PySpark 3.5.1 · Java 17 · hadoop-aws 3.3.4 · Microsoft JDBC driver 13.4.0 (jre11) · Postgres 16 · dbt-core 1.12.6 · dbt-sqlserver 1.12.1 · pyodbc 5.3.0 · ODBC Driver 18 for SQL Server · `pgsty/silo` RELEASE.2026-09-16T00-00-00Z · SQL Server 2022 (Developer, in Compose) · Kafka 3.9.0 (KRaft, single node) · spark-sql-kafka-0-10 3.5.1 · websocket-client 1.8.0 · confluent-kafka 2.6.0
 
 ## 14. Data source terms
 

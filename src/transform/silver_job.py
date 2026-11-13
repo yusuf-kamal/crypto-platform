@@ -1,4 +1,3 @@
-import json
 import os
 import sys
 import tempfile
@@ -9,6 +8,7 @@ import boto3
 from pyspark import StorageLevel
 from pyspark.sql import functions as F
 
+from src.common.observability import json_log, write_run_metrics
 from src.common.spark import get_spark
 from src.transform.silver_aggtrades import RAW_COLUMNS, parse_raw, tag_rejects
 
@@ -87,7 +87,16 @@ def run(symbol: str, month: str) -> dict:
         "seconds": round(time.time() - started, 1),
         "timings": timings,
     }
-    print(json.dumps(metrics))
+    json_log("silver_file_processed", **metrics)
+    write_run_metrics(spark, "silver", [{
+        "entity": f"{symbol}|{month}",
+        "status": "processed",
+        "rows_in": total,
+        "rows_valid": n_valid,
+        "rows_rejected": n_rejected,
+        "seconds": metrics["seconds"],
+        "details": {"timings": timings, "error_rate": metrics["error_rate"]},
+    }])
     return metrics
 
 

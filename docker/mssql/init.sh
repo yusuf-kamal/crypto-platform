@@ -43,9 +43,24 @@ run() {
     "$SQLCMD" -S "${MSSQL_HOST:-mssql}" -U sa -P "$MSSQL_SA_PASSWORD" $EXTRA -b "$@"
 }
 
+# Readiness is not "master answers". On a restart the warehouse already
+# exists, and SQL Server accepts connections to master while it is still
+# recovering user databases -- the first script then fails with
+#
+#   Msg 904: Database 5 cannot be autostarted during server shutdown or startup
+#
+# which looks like a broken script rather than an impatient one. So the probe
+# also requires CryptoDWH to be ONLINE, while still passing on a fresh volume
+# where it does not exist yet. -b makes sqlcmd exit non-zero on the RAISERROR.
+READY_PROBE="SET NOCOUNT ON;
+IF DB_ID('CryptoDWH') IS NOT NULL
+   AND DATABASEPROPERTYEX('CryptoDWH', 'Status') <> 'ONLINE'
+    RAISERROR('warehouse still recovering', 16, 1);
+SELECT 1;"
+
 echo "waiting for SQL Server..."
 i=0
-until run -Q "SELECT 1" >/dev/null 2>&1; do
+until run -Q "$READY_PROBE" >/dev/null 2>&1; do
     i=$((i + 1))
     if [ "$i" -gt 60 ]; then
         echo "SQL Server did not become ready in time" >&2

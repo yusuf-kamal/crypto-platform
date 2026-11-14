@@ -4,7 +4,7 @@
 
 An end-to-end data engineering project that ingests Binance historical trade data, processes it through a Bronze / Silver / Gold (medallion) lake, and serves 1-minute candles from a SQL Server star schema. Built as the Data Pill Data Engineering graduation project.
 
-> **Project status:** the batch path (ingestion → Silver → Gold → dbt) runs end to end on real data. Both source types, the streaming path, orchestrated dbt, observability, Delta Lake, the reporting views and CI are built; the streaming path and the dbt tests on the newer models have not yet been run against live data, and the dashboard is still open. See [Status](#2-status) for the per-area checklist, which says what is verified and what is only written.
+> **Project status:** the batch path (ingestion → Silver → Gold → dbt, including the constraints and the metrics table) has been run end to end on real data and is verified. Both source types, the streaming path, orchestrated dbt, observability, Delta Lake, the reporting views and CI are built; the streaming path and the dbt tests on the newer models have not yet been run against live data, and the dashboard is still open. See [Status](#2-status) for the per-area checklist, which says what is verified and what is only written.
 
 ---
 
@@ -28,13 +28,14 @@ The volatility view is also where the two sources meet: the candle fact gives th
 
 | Area | State |
 |---|---|
+| The batch path runs end to end on real data, full scope | Done. All 25 files, 339,801,204 rows, 0 rejected, 1,101,600 fact rows |
 | Batch ingestion from Binance public archive (5 symbols x 5 months = 25 files) | Done |
-| Second source type: CoinGecko API + Fear & Greed Index API (daily grain) | Done |
-| Streaming source (Binance WebSocket -> Kafka -> Spark Structured Streaming) | Code complete, not yet run against the live stream |
+| Second source type: CoinGecko API + Fear & Greed Index API (daily grain) | Done, verified on a real run |
+| Streaming source (Binance WebSocket -> Kafka -> Spark Structured Streaming) | Done, verified against the live stream |
 | Data lake with Bronze / Silver / Gold buckets (S3-compatible) | Done |
 | Silver: Spark typing, cleaning, de-duplication, quarantine | Done |
 | Warehouse: SQL Server star schema, dbt incremental models | Done |
-| Data quality: 62 Python unit tests, 39 dbt tests | Done. The 62 Python tests pass in CI; of the dbt tests, 13 are verified against real data and the remaining 26 (API facts, reporting views, ops) have been parsed but not yet run |
+| Data quality: 90 Python unit tests, 39 dbt tests | Done. The Python tests pass in CI, and all 39 dbt tests pass against real data (see [section 10](#10-performance-tuning-measured)) |
 | Orchestration: 7 Airflow DAGs, chained with Assets where they produce data | Done |
 | Airflow task that runs dbt (run, test, docs generate) | Done |
 | Gold recomputes only newly processed Silver files | Done |
@@ -47,8 +48,9 @@ The volatility view is also where the two sources meet: the candle fact gives th
 | GitHub Actions CI: ruff, unit tests, DAG import check, `docker compose config`, `dbt parse` | Done |
 | Warehouse keys and checks survive a dbt `--full-refresh` | Done |
 | Reporting views, one per business question, with their own grain and range tests | Done |
-| Power BI dashboard on top of those views | Planned |
-| Delta Lake on the Silver layer (atomic writes, `replaceWhere`, time travel) | Code complete, not yet run |
+| Power BI: model, measures and layout specified in `powerbi/` | Done |
+| Power BI: the .pbix itself, assembled in Desktop | Planned |
+| Delta Lake on the Silver layer (atomic writes, `replaceWhere`, time travel) | Done, verified on a real run |
 | Iceberg, CDC, Terraform | Not started |
 
 ---
@@ -195,7 +197,15 @@ docker run --rm python:3.12-slim python -c "import secrets,base64; print(base64.
 docker compose up -d
 ```
 
-The first run builds three images, and the Airflow one downloads about 280 MB of Spark jars from Maven -- most of it the single `aws-java-sdk-bundle` at 268 MB. Expect roughly ten minutes before anything starts; it is not hung.
+The first run builds three images, and the Airflow one downloads about 280 MB of Spark jars from Maven -- most of it the single `aws-java-sdk-bundle` at 268 MB. Expect ten minutes or so before anything starts; it is not hung. The `curl` calls retry and resume, so a dropped connection costs a pause rather than the whole build (it used to fail the layer with exit 18 and throw the ten minutes away).
+
+To get that download out of the way first -- on a slow link, or so the build is warm before you need it:
+
+```powershell
+bash scripts/prefetch.sh
+```
+
+It pulls every third-party image, builds the three local ones, retries each step, and finishes by checking that all nine jars are really in the Airflow image. Safe to re-run: Docker skips what it already has, and the script starts no container.
 
 The `mssql-init` service then waits for SQL Server and applies every script in `sql/` in alphabetical order, which is also the correct order:
 
@@ -311,6 +321,8 @@ docker/
   dbt/                         dbt image with the project baked in (ODBC)
   mssql/init.sh                applies sql/ once SQL Server is up
   streaming/                   small image for the WebSocket producer
+powerbi/                       model, DAX measures and the dashboard design
+scripts/prefetch.sh            pulls images and builds, with retries, before the first start
 tests/                         PySpark + plain Python unit tests
 notebooks/                     exploration (outputs kept: they are the row counts quoted in section 4)
 docker-compose.yml
@@ -478,9 +490,125 @@ Stage timings of the final run: download + unzip 2.0 s, read + parse 24.7 s, qua
 | Gold staging build, 5 symbols x 5 months | 379.8 s |
 | `dbt run` (dim_symbol + fact_candles_1m, 1.1 M rows) | 27.3 s |
 | `dbt test` (13 tests) | 6.9 s |
-| Silver, 25 files, total wall-clock | `<TODO: from the Airflow run duration>` |
+| Silver, 25 files, total Spark compute time | **149.7 minutes** (sum of each file's own processing time) |
+| Silver, 25 files, calendar wall-clock | 13h 45m -- not a clean number; see "Full-scope run" below for why |
 
 ---
+
+### First end-to-end run on Delta
+
+The run that this section had been waiting for. One file rather than the full
+scope, so the numbers above are not superseded -- they are a different
+workload on a different machine, and nothing here is a controlled comparison
+with them.
+
+**Workload:** `XRPUSDT` 2026-10, 4,740,009 trades, 0 rejected. Windows 11, 12
+logical CPUs, Docker Desktop limited to 7.6 GB, `SPARK_DRIVER_MEMORY=4g`,
+Silver written as Delta.
+
+| Stage | Seconds |
+|---|---|
+| Download + unzip from Bronze | 2.4 |
+| Read, parse, count | 39.6 |
+| Quarantine pass | 7.9 |
+| De-duplicate + count | 32.7 |
+| **Delta write** | **19.4** |
+| Silver total | **107.8** |
+| Gold: candles + JDBC to staging | 30.9 |
+| `dbt run`, 8 models | ~11 |
+| `dbt test`, 39 tests | ~9 |
+| Trigger to `dbt docs generate` finished | **3 min 33 s** |
+
+**What the run confirmed**, beyond the timings:
+
+- 44,640 fact rows, which is 31 days x 1,440 minutes x 1 symbol exactly.
+- 4,740,009 Silver rows, 0 rejected -- the same count this symbol-month has
+  in the exploration notebook, measured months apart on a different machine.
+- All 39 dbt tests pass against real data. 26 of them had only ever been
+  parsed before.
+- All 16 warehouse constraints exist after the dbt build: 6 primary keys, 6
+  foreign keys, 4 checks. This is what the one-owner-per-table change was
+  for, and it is the first proof that the hooks actually restore them.
+- `ops.vw_pipeline_health` returns `ok` for both layers with the row counts
+  and per-stage timings above, so the metrics path works end to end.
+
+### API path and streaming, first real run
+
+Both ran on 2026-11-14, after the batch path. Neither had ever been started.
+
+**API path.** `api_daily_ingestion` fetched both sources; `api_daily_warehouse`
+loaded them.
+
+| | |
+|---|---|
+| CoinGecko rows | 1,825 (5 coins x 365 days), **5 rejected** |
+| Fear & Greed rows | 3,205, back to its first publication on 2018-02-01 |
+| Job duration | 36.8 s |
+
+The five rejects are the `partial_or_unparseable_day` rule doing exactly what
+it was written for: one per coin, each the running day that CoinGecko stamps
+at "now" rather than at midnight. Keeping them would have made the newest row
+change on every run.
+
+**Streaming.** Kafka, the WebSocket producer and the Structured Streaming
+consumer, against the live `xrpusdt` stream. 4,334 messages produced,
+eight consecutive 1-minute candles committed to `s3a://silver/stream_candles_1m`
+as Delta, each published once its window closed.
+
+```
+symbol   candle_ts            open      high      low       close     volume      trades
+XRPUSDT  2026-11-14 08:22:00  0.98590   0.98670   0.98590   0.98670     9,779.6      127
+XRPUSDT  2026-11-14 08:23:00  0.98670   0.98700   0.98630   0.98640    26,539.8      192
+XRPUSDT  2026-11-14 08:29:00  0.98680   0.98740   0.98430   0.98560   222,473.6    1,036
+```
+
+On every row, `buy_volume + sell_volume` equals `volume` exactly -- the
+invariant the unit tests assert, now holding on live data.
+
+### Full-scope run (all 25 files)
+
+Triggered on 2026-11-14 at 09:26 UTC, finished 23:11 UTC. The gap between
+those two numbers and the 149.7-minute compute total above is the point of
+this section: two infrastructure limits showed up only at this scale, and
+each one stopped the run rather than slowing it down.
+
+**Result, once both were fixed:**
+
+| | |
+|---|---|
+| Silver rows | 339,801,204 across 25 files, **0 rejected** |
+| `fact_candles_1m` | **1,101,600** -- exactly 5 symbols x 153 days x 1,440 minutes |
+| Largest file | BTCUSDT 2026-06, 34,074,359 rows, 1,159 s |
+| Smallest file | XRPUSDT 2026-07, 2,644,553 rows, 151 s |
+| dbt | PASS=39 ERROR=0, same as the one-file run |
+
+**What actually happened, in order:**
+
+1. `SPARK_DRIVER_MEMORY=4g` (set for the one-file test) OOM'd on BTCUSDT
+   2026-06, the first and largest file. Raised the Docker Desktop memory
+   limit from 7.6 GB to 10 GB via `.wslconfig`, and the driver to 7g.
+2. With more memory but the same default config, four files (BTCUSDT
+   2026-08/09/10, ETHUSDT 2026-06) failed with
+   `RpcTimeoutException: Futures timed out after 10000 milliseconds` --
+   Spark's executor heartbeat, not a resource limit. A GC pause on a
+   20-30M row file routinely runs longer than the 10-second default, so the
+   driver missed its own heartbeat and Spark killed the task, reading as a
+   hang rather than as a timeout tuned for a cluster with headroom to
+   spare. Fixed once, for every job, in `src/common/spark.py`:
+   `spark.executor.heartbeatInterval=60s`, `spark.network.timeout=300s`.
+3. Lowered the driver back to 5g (7g had left too little margin for the
+   other containers) and retried the four failed files.
+4. While the last of those four (ETHUSDT 2026-06) was running, the Docker
+   Desktop engine itself stopped responding -- every `docker` command
+   returned `500 Internal Server Error`. A plain restart did not fix it;
+   only `wsl --shutdown` followed by a full Docker Desktop restart brought
+   the engine back. One file's Silver manifest was not yet written at that
+   point and had to be re-run; the other 24, and everything already in the
+   warehouse, were intact in their volumes across the crash.
+
+None of this is a data problem -- 0 rows were ever rejected, in either run.
+It is what the first attempt at this scale looks like, which is exactly
+what this section exists to record rather than smooth over.
 
 ## 11. Challenges and how they were solved
 
@@ -491,6 +619,9 @@ Stage timings of the final run: download + unzip 2.0 s, read + parse 24.7 s, qua
 | Spark `OutOfMemoryError` on large monthly files | Raised driver memory (3g to 6g) and the WSL memory limit; reduced scope to fit a 16 GB machine |
 | Silver writes very slow (6,000+ tiny files per month) | Diagnosed with per-stage timings, then committer v2 and repartition (section 10) |
 | SQL Server error 8645 (timeout waiting for memory) during `dbt run` | Host RAM was exhausted by the WSL VM; freed memory by shutting down WSL, added an index on the staging table |
+| `UndefinedError: 'ds' is undefined` on the API warehouse DAG | It is Asset-triggered, and an Asset-triggered run has no data interval -- so `{{ ds }}` is not empty there, it does not exist, and rendering it fails the task before it starts. The sibling DAG uses the same line and works, because it runs on a schedule. The day is now resolved from what Bronze actually holds |
+| 2,522 of 3,205 Fear & Greed days vanished into nothing | `dim_date` started in 2025; the index goes back to 2018-02-01. The fact model joins the dimension with an inner join, so those days were dropped with no error anywhere -- the table would simply have been a fifth of its proper size. `assert_api_facts_cover_staging`, written for exactly this, failed the build. dim_date now covers 2018-2027, which is 3,653 rows |
+| The first real build died at the last layer with `exit code: 18` | curl's CURLE_PARTIAL_FILE: a dropped connection mid-download. `curl -fsSLO` does not retry a truncated transfer, so one interruption anywhere in 280 MB discarded the whole Airflow image -- ten and a half minutes of build, surfaced only as a BuildKit wall of text ending in a bare exit code. The jar URLs were all correct; it was transport, not coordinates. Fixed with `--retry-all-errors --continue-at -` plus a prefetch script |
 | Every streaming test failed with `AMBIGUOUS_REFERENCE: t` | Binance names the trade id `t` and the trade time `T`, and Spark resolves names case-insensitively, so a `from_json` struct holding both fields makes every reference to either one fail. Parsing with `get_json_object`, whose JSON paths are case-sensitive, fixes it without turning on `spark.sql.caseSensitive` session-wide |
 | dbt silently dropped the star schema's keys | sql/01 created `dim_symbol` and `fact_candles_1m`, but dbt materializes the same names: the first `--full-refresh` replaced them with constraint-free tables. The DDL now stops at the seeded dimensions and every key, foreign key and check is a dbt hook |
 | Airflow UI crash (React error #185) with several Airflow instances on `localhost` | Conflicting browser cookies; used `127.0.0.1` and stopped unrelated containers |

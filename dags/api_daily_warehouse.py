@@ -30,11 +30,15 @@ def api_daily_warehouse():
     def build(ds: str) -> dict:
         from src.transform.api_job import run
 
+        # Empty unless someone triggers this DAG with a config, which is the
+        # normal case: an Asset-triggered run has no data interval, so there
+        # is no `{{ ds }}` to render -- referencing it fails the task before
+        # it starts. run() then resolves the day from what Bronze holds.
         metrics = run(ds)
         log.info("api silver + staging built: %s", metrics)
         return metrics
 
-    build(ds="{{ ds }}")
+    build(ds="{{ dag_run.conf.get('ds', '') }}")
 
 
 api_daily_warehouse()

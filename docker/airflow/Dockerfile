@@ -18,16 +18,31 @@ ENV JAVA_HOME=/opt/java
 # had bidirectional client/broker compatibility since 0.10.2 and an older
 # client against a newer broker is the supported direction; "fixing" this to
 # 3.9.0 would introduce a mismatch rather than remove one.
+#
+# The retry flags are not optional. This layer pulls about 280 MB, 268 MB of
+# which is aws-java-sdk-bundle alone, and a plain `curl -fsSLO` does not retry
+# a partial transfer: one dropped connection anywhere in those 280 MB fails
+# with exit 18 (CURLE_PARTIAL_FILE) and discards the whole layer. Because this
+# is the last RUN of the build, that costs the entire image -- measured at ten
+# and a half minutes on one machine. --retry-all-errors is what makes curl
+# retry a truncated transfer at all, and --continue-at - resumes instead of
+# restarting 268 MB. The URLs themselves are verified: all nine resolve.
+ARG CURL_RETRY="--retry 5 --retry-delay 3 --retry-all-errors --continue-at -"
 RUN mkdir -p /opt/spark-jars && cd /opt/spark-jars \
-    && curl -fsSLO https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar \
-    && curl -fsSLO https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar \
-    && curl -fsSLO https://repo1.maven.org/maven2/com/microsoft/sqlserver/mssql-jdbc/13.4.0.jre11/mssql-jdbc-13.4.0.jre11.jar \
-    && curl -fsSLO https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_2.12/3.5.1/spark-sql-kafka-0-10_2.12-3.5.1.jar \
-    && curl -fsSLO https://repo1.maven.org/maven2/org/apache/spark/spark-token-provider-kafka-0-10_2.12/3.5.1/spark-token-provider-kafka-0-10_2.12-3.5.1.jar \
-    && curl -fsSLO https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.4.1/kafka-clients-3.4.1.jar \
-    && curl -fsSLO https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/2.11.1/commons-pool2-2.11.1.jar \
-    && curl -fsSLO https://repo1.maven.org/maven2/io/delta/delta-spark_2.12/3.2.0/delta-spark_2.12-3.2.0.jar \
-    && curl -fsSLO https://repo1.maven.org/maven2/io/delta/delta-storage/3.2.0/delta-storage-3.2.0.jar
+    && for url in \
+        https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar \
+        https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar \
+        https://repo1.maven.org/maven2/com/microsoft/sqlserver/mssql-jdbc/13.4.0.jre11/mssql-jdbc-13.4.0.jre11.jar \
+        https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_2.12/3.5.1/spark-sql-kafka-0-10_2.12-3.5.1.jar \
+        https://repo1.maven.org/maven2/org/apache/spark/spark-token-provider-kafka-0-10_2.12/3.5.1/spark-token-provider-kafka-0-10_2.12-3.5.1.jar \
+        https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.4.1/kafka-clients-3.4.1.jar \
+        https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/2.11.1/commons-pool2-2.11.1.jar \
+        https://repo1.maven.org/maven2/io/delta/delta-spark_2.12/3.2.0/delta-spark_2.12-3.2.0.jar \
+        https://repo1.maven.org/maven2/io/delta/delta-storage/3.2.0/delta-storage-3.2.0.jar \
+    ; do \
+        echo "fetching $(basename "$url")" \
+        && curl -fsSLO $CURL_RETRY "$url" ; \
+    done
 USER airflow
 COPY requirements.txt /requirements.txt
 RUN pip install --no-cache-dir -r /requirements.txt

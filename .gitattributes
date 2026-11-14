@@ -1,0 +1,27 @@
+# Shell scripts in this repository are executed inside Linux containers, and
+# Git on Windows checks files out with CRLF by default. A shell script with
+# CRLF endings fails on its first line with a message that points at the
+# wrong thing entirely:
+#
+#   /init/init.sh: 13: set: Illegal option -
+#
+# Line 13 is `set -eu`; the shell is reading `-eu\r`. The same applies to
+# anything else a container interprets line by line.
+*.sh            text eol=lf
+Dockerfile      text eol=lf
+*.Dockerfile    text eol=lf
+
+# Normalise the rest on commit, and keep the files that are read by Linux
+# tooling at LF in the working copy too.
+*               text=auto
+*.py            text eol=lf
+*.sql           text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.dax           text eol=lf
+
+# Binary: never touch.
+*.jpg           binary
+*.png           binary
+*.zip           binary
+*.parquet       binary

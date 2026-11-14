@@ -1,0 +1,249 @@
+// =====================================================================
+// Measures for the Crypto Market Desk report.
+//
+// Paste these into a dedicated measure table (see powerbi/README.md) rather
+// than hanging them off a fact table: a measure's home table has no effect on
+// what it computes, and keeping them in one place is the difference between a
+// model someone can read in a year and one they cannot.
+//
+// Naming: what a reader of the report would call the number, not what the
+// column is called. "Turnover", not "Sum of quote_volume".
+// =====================================================================
+
+
+// ---------------------------------------------------------------------
+// Question 1 — which pairs trade the most, and at which hours
+// ---------------------------------------------------------------------
+
+Volume =
+SUM ( vw_symbol_hourly_activity[volume] )
+
+-- Turnover is the honest cross-symbol total. Volume is in each pair's base
+-- asset, so adding BTC to XRP volume is adding apples to pears; quote_volume
+-- is USDT for every pair and is the only one that may be summed across them.
+Turnover =
+SUM ( vw_symbol_hourly_activity[quote_volume] )
+
+Trades =
+SUM ( vw_symbol_hourly_activity[trade_count] )
+
+-- Share of the turnover of whatever is in scope. ALLSELECTED, not ALL, so
+-- the share respects a slicer on the page but ignores the row's own symbol.
+Turnover share =
+DIVIDE (
+    [Turnover],
+    CALCULATE ( [Turnover], ALLSELECTED ( dim_symbol[symbol] ) )
+)
+
+-- The hour label, not the hour's turnover: a card showing "13:00" answers
+-- "when" directly. TOPN returns a table, so MAXX collapses a tie to the
+-- later hour rather than erroring.
+Busiest hour =
+VAR Ranked =
+    TOPN (
+        1,
+        SUMMARIZE (
+            vw_symbol_hourly_activity,
+            vw_symbol_hourly_activity[hour_utc],
+            "@turnover", [Turnover]
+        ),
+        [@turnover], DESC
+    )
+VAR H = MAXX ( Ranked, vw_symbol_hourly_activity[hour_utc] )
+RETURN
+    IF ( NOT ISBLANK ( H ), FORMAT ( H, "00" ) & ":00" )
+
+Quietest hour =
+VAR Ranked =
+    TOPN (
+        1,
+        SUMMARIZE (
+            vw_symbol_hourly_activity,
+            vw_symbol_hourly_activity[hour_utc],
+            "@turnover", [Turnover]
+        ),
+        [@turnover], ASC
+    )
+VAR H = MAXX ( Ranked, vw_symbol_hourly_activity[hour_utc] )
+RETURN
+    IF ( NOT ISBLANK ( H ), FORMAT ( H, "00" ) & ":00" )
+
+-- How much busier the peak hour is than the quiet one. A flat number like
+-- "2.1x" says more about a trading day than either hour alone.
+Peak to trough ratio =
+VAR ByHour =
+    SUMMARIZE (
+        vw_symbol_hourly_activity,
+        vw_symbol_hourly_activity[hour_utc],
+        "@turnover", [Turnover]
+    )
+RETURN
+    DIVIDE ( MAXX ( ByHour, [@turnover] ), MINX ( ByHour, [@turnover] ) )
+
+-- Each row of the heatmap is scaled to its own peak, so a quiet pair is still
+-- readable next to BTCUSDT. Without this the matrix is one bright row and
+-- four dark ones.
+Turnover vs own peak =
+VAR OwnPeak =
+    CALCULATE (
+        [Turnover],
+        ALL ( vw_symbol_hourly_activity[hour_utc] ),
+        VALUES ( vw_symbol_hourly_activity[hour_utc] )
+    )
+VAR PeakForSymbol =
+    MAXX (
+        CALCULATETABLE (
+            SUMMARIZE (
+                vw_symbol_hourly_activity,
+                vw_symbol_hourly_activity[hour_utc],
+                "@t", [Turnover]
+            ),
+            ALL ( vw_symbol_hourly_activity[hour_utc] )
+        ),
+        [@t]
+    )
+RETURN
+    DIVIDE ( [Turnover], PeakForSymbol )
+
+-- Coverage: a thin hour must not pass for a busy one. 1,440 minutes a day.
+Minutes traded =
+SUM ( vw_symbol_hourly_activity[minutes_traded] )
+
+Minute coverage =
+VAR Expected =
+    COUNTROWS ( vw_symbol_hourly_activity ) * 60
+RETURN
+    DIVIDE ( [Minutes traded], Expected )
+
+
+// ---------------------------------------------------------------------
+// Question 2 — how volatile each pair is, and when
+// ---------------------------------------------------------------------
+
+-- AVERAGE over the view's own per-day percentage. Correct here because the
+-- grain of the view is already one row per symbol per day, so every row is
+-- one day and the average is unweighted on purpose.
+Avg daily range % =
+AVERAGE ( vw_symbol_daily_volatility[day_range_pct] )
+
+Widest daily range % =
+MAX ( vw_symbol_daily_volatility[day_range_pct] )
+
+-- The day and pair behind that number, for a subtitle. Without it, "11.6%"
+-- is a number nobody can check.
+Widest range day =
+VAR Worst = [Widest daily range %]
+VAR Row =
+    TOPN (
+        1,
+        SUMMARIZE (
+            vw_symbol_daily_volatility,
+            dim_symbol[symbol],
+            dim_date[full_date],
+            "@r", [Avg daily range %]
+        ),
+        [@r], DESC
+    )
+RETURN
+    IF (
+        NOT ISBLANK ( Worst ),
+        MAXX ( Row, dim_symbol[symbol] ) & " on "
+            & FORMAT ( MAXX ( Row, dim_date[full_date] ), "MM-DD" )
+    )
+
+Avg minute range =
+AVERAGE ( vw_symbol_daily_volatility[avg_minute_range] )
+
+Up days % =
+DIVIDE (
+    CALCULATE (
+        COUNTROWS ( vw_symbol_daily_volatility ),
+        vw_symbol_daily_volatility[day_change_pct] > 0
+    ),
+    COUNTROWS ( vw_symbol_daily_volatility )
+)
+
+-- Market-wide, so it must not be summed or averaged per symbol: five rows
+-- for one day all carry the same index value. Averaging over distinct dates
+-- is the only reading that is not nonsense.
+Avg Fear and Greed =
+AVERAGEX (
+    VALUES ( dim_date[full_date] ),
+    CALCULATE ( MAX ( vw_symbol_daily_volatility[fng_value] ) )
+)
+
+-- A daily snapshot, not a flow: summing market cap across days would invent
+-- a number with no meaning. Take the last day in scope.
+Market cap =
+CALCULATE (
+    SUM ( vw_symbol_daily_volatility[market_cap_usd] ),
+    LASTNONBLANK ( dim_date[full_date], 1 )
+)
+
+-- Our measured turnover against the whole market's reported volume. Both are
+-- USD, and the comparison is the point of having a second source at all.
+Share of market volume =
+DIVIDE (
+    [Turnover],
+    SUM ( vw_symbol_daily_volatility[market_volume_usd] )
+)
+
+
+// ---------------------------------------------------------------------
+// Question 3 — who crossed the spread
+// ---------------------------------------------------------------------
+
+Buy volume =
+SUM ( vw_symbol_buy_sell_balance[buy_volume] )
+
+Sell volume =
+SUM ( vw_symbol_buy_sell_balance[sell_volume] )
+
+Net flow =
+SUM ( vw_symbol_buy_sell_balance[net_flow] )
+
+-- THE measure to get right in this model. The view has a buy_share column
+-- per day, and AVERAGE() of it would be wrong: it weights a dead Sunday the
+-- same as the heaviest day of the quarter. A share of a total is always
+-- recomputed from the totals.
+--     wrong: AVERAGE ( vw_symbol_buy_sell_balance[buy_share] )
+--     right: the division below
+Buy share =
+DIVIDE (
+    [Buy volume],
+    SUM ( vw_symbol_buy_sell_balance[volume] )
+)
+
+-- Signed distance from an even split, in percentage points. Easier to read
+-- on a diverging bar than 0.512 vs 0.488.
+Buy pressure pp =
+( [Buy share] - 0.5 ) * 100
+
+Net buying days =
+CALCULATE (
+    DISTINCTCOUNT ( dim_date[full_date] ),
+    FILTER (
+        SUMMARIZE (
+            vw_symbol_buy_sell_balance,
+            dim_date[full_date],
+            "@share", [Buy share]
+        ),
+        [@share] > 0.5
+    )
+)
+
+Net buying days % =
+DIVIDE ( [Net buying days], DISTINCTCOUNT ( dim_date[full_date] ) )
+
+
+// ---------------------------------------------------------------------
+// Formatting, applied in the model rather than per visual
+// ---------------------------------------------------------------------
+// Turnover, Market cap, Share of market volume : currency, 1 decimal, $ / B
+// Turnover share, Minute coverage, Buy share,
+//   Up days %, Net buying days %                : percentage, 1 decimal
+// Avg daily range %, Widest daily range %        : number, 2 decimals, "%" suffix
+//   (the view already returns percent, not a fraction -- do NOT format as %)
+// Buy pressure pp                                : number, 2 decimals, " pp" suffix
+// Trades, Minutes traded, Net buying days        : whole number, thousands separator
+// Busiest hour, Quietest hour, Widest range day  : text

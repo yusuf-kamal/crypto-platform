@@ -41,7 +41,10 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - run: pip install pyspark==3.5.1 pytest==8.3.4
+      # requests comes with the project (docker/airflow/requirements.txt);
+      # src/ingestion/api_sources.py imports it at module level, so the tests
+      # cannot even be collected without it.
+      - run: pip install pyspark==3.5.1 pytest==8.3.4 requests==2.32.3
 
       # The tests import src.*, so the repo root must be importable.
       - run: pytest tests -q

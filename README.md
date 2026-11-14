@@ -30,8 +30,8 @@ The volatility view is also where the two sources meet: the candle fact gives th
 |---|---|
 | The batch path runs end to end on real data | Done. One symbol-month verified in 3 min 33 s; the full 25-file scope has not been run |
 | Batch ingestion from Binance public archive (5 symbols x 5 months = 25 files) | Done |
-| Second source type: CoinGecko API + Fear & Greed Index API (daily grain) | Done |
-| Streaming source (Binance WebSocket -> Kafka -> Spark Structured Streaming) | Code complete, not yet run against the live stream |
+| Second source type: CoinGecko API + Fear & Greed Index API (daily grain) | Done, verified on a real run |
+| Streaming source (Binance WebSocket -> Kafka -> Spark Structured Streaming) | Done, verified against the live stream |
 | Data lake with Bronze / Silver / Gold buckets (S3-compatible) | Done |
 | Silver: Spark typing, cleaning, de-duplication, quarantine | Done |
 | Warehouse: SQL Server star schema, dbt incremental models | Done |
@@ -531,6 +531,39 @@ Silver written as Delta.
 - `ops.vw_pipeline_health` returns `ok` for both layers with the row counts
   and per-stage timings above, so the metrics path works end to end.
 
+### API path and streaming, first real run
+
+Both ran on 2026-11-14, after the batch path. Neither had ever been started.
+
+**API path.** `api_daily_ingestion` fetched both sources; `api_daily_warehouse`
+loaded them.
+
+| | |
+|---|---|
+| CoinGecko rows | 1,825 (5 coins x 365 days), **5 rejected** |
+| Fear & Greed rows | 3,205, back to its first publication on 2018-02-01 |
+| Job duration | 36.8 s |
+
+The five rejects are the `partial_or_unparseable_day` rule doing exactly what
+it was written for: one per coin, each the running day that CoinGecko stamps
+at "now" rather than at midnight. Keeping them would have made the newest row
+change on every run.
+
+**Streaming.** Kafka, the WebSocket producer and the Structured Streaming
+consumer, against the live `xrpusdt` stream. 4,334 messages produced,
+eight consecutive 1-minute candles committed to `s3a://silver/stream_candles_1m`
+as Delta, each published once its window closed.
+
+```
+symbol   candle_ts            open      high      low       close     volume      trades
+XRPUSDT  2026-11-14 08:22:00  0.98590   0.98670   0.98590   0.98670     9,779.6      127
+XRPUSDT  2026-11-14 08:23:00  0.98670   0.98700   0.98630   0.98640    26,539.8      192
+XRPUSDT  2026-11-14 08:29:00  0.98680   0.98740   0.98430   0.98560   222,473.6    1,036
+```
+
+On every row, `buy_volume + sell_volume` equals `volume` exactly -- the
+invariant the unit tests assert, now holding on live data.
+
 ## 11. Challenges and how they were solved
 
 | Challenge | Solution |
@@ -540,6 +573,8 @@ Silver written as Delta.
 | Spark `OutOfMemoryError` on large monthly files | Raised driver memory (3g to 6g) and the WSL memory limit; reduced scope to fit a 16 GB machine |
 | Silver writes very slow (6,000+ tiny files per month) | Diagnosed with per-stage timings, then committer v2 and repartition (section 10) |
 | SQL Server error 8645 (timeout waiting for memory) during `dbt run` | Host RAM was exhausted by the WSL VM; freed memory by shutting down WSL, added an index on the staging table |
+| `UndefinedError: 'ds' is undefined` on the API warehouse DAG | It is Asset-triggered, and an Asset-triggered run has no data interval -- so `{{ ds }}` is not empty there, it does not exist, and rendering it fails the task before it starts. The sibling DAG uses the same line and works, because it runs on a schedule. The day is now resolved from what Bronze actually holds |
+| 2,522 of 3,205 Fear & Greed days vanished into nothing | `dim_date` started in 2025; the index goes back to 2018-02-01. The fact model joins the dimension with an inner join, so those days were dropped with no error anywhere -- the table would simply have been a fifth of its proper size. `assert_api_facts_cover_staging`, written for exactly this, failed the build. dim_date now covers 2018-2027, which is 3,653 rows |
 | The first real build died at the last layer with `exit code: 18` | curl's CURLE_PARTIAL_FILE: a dropped connection mid-download. `curl -fsSLO` does not retry a truncated transfer, so one interruption anywhere in 280 MB discarded the whole Airflow image -- ten and a half minutes of build, surfaced only as a BuildKit wall of text ending in a bare exit code. The jar URLs were all correct; it was transport, not coordinates. Fixed with `--retry-all-errors --continue-at -` plus a prefetch script |
 | Every streaming test failed with `AMBIGUOUS_REFERENCE: t` | Binance names the trade id `t` and the trade time `T`, and Spark resolves names case-insensitively, so a `from_json` struct holding both fields makes every reference to either one fail. Parsing with `get_json_object`, whose JSON paths are case-sensitive, fixes it without turning on `spark.sql.caseSensitive` session-wide |
 | dbt silently dropped the star schema's keys | sql/01 created `dim_symbol` and `fact_candles_1m`, but dbt materializes the same names: the first `--full-refresh` replaced them with constraint-free tables. The DDL now stops at the seeded dimensions and every key, foreign key and check is a dbt hook |

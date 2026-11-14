@@ -44,6 +44,7 @@ from src.transform.api_daily import (
 BRONZE_BUCKET = "bronze"
 MARKET_KEY = "coingecko/market_chart/coin_id={coin_id}/{ds}.json"
 FNG_KEY = "alternative_me/fear_greed/{ds}.json"
+FNG_PREFIX = "alternative_me/fear_greed/"
 
 STAGING_MARKET = "staging.coin_market_daily"
 STAGING_FNG = "staging.fear_greed_daily"
@@ -83,6 +84,30 @@ def _s3():
     )
 
 
+def latest_bronze_ds(s3) -> str:
+    """The most recent day that Bronze actually holds.
+
+    This job is triggered by an Asset, and an Asset-triggered DAG run has no
+    data interval -- so `{{ ds }}` is not merely empty there, it is undefined,
+    and rendering it fails the task before it starts. The day therefore comes
+    from the data rather than from the scheduler, which is also the more
+    honest source: it is the day whose file is really there to process.
+    """
+    days = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BRONZE_BUCKET, Prefix=FNG_PREFIX):
+        for obj in page.get("Contents", []):
+            name = obj["Key"].rsplit("/", 1)[-1]
+            if name.endswith(".json"):
+                days.append(name.removesuffix(".json"))
+    if not days:
+        raise RuntimeError(
+            f"no Fear & Greed payload under s3://{BRONZE_BUCKET}/{FNG_PREFIX} "
+            "- run api_daily_ingestion first"
+        )
+    return max(days)
+
+
 def _read_bronze_json(s3, key: str) -> dict:
     body = s3.get_object(Bucket=BRONZE_BUCKET, Key=key)["Body"].read()
     return json.loads(body)
@@ -109,10 +134,17 @@ def _write_staging(df, table: str) -> None:
     )
 
 
-def run(ds: str) -> dict:
+def run(ds: str | None = None) -> dict:
+    """Build Silver and staging for one day of API payloads.
+
+    `ds` is optional on purpose: the DAG that calls this is Asset-triggered
+    and has no data interval to take a date from, so with no argument the
+    day is resolved from Bronze instead.
+    """
     started = time.time()
-    spark = get_spark(f"api_daily_{ds}")
     s3 = _s3()
+    ds = (ds or "").strip() or latest_bronze_ds(s3)
+    spark = get_spark(f"api_daily_{ds}")
 
     market_rows: list[dict] = []
     for symbol, coin_id in COINGECKO_IDS.items():

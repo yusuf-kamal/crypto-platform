@@ -4,14 +4,22 @@ GO
 -- ---------------------------------------------------------------------------
 -- 1) Extend dim_date backwards.
 --
--- sql/02 seeds 2026-2027, but CoinGecko's free tier returns the last 365 days,
--- which reaches into 2025. A date that is missing from dim_date would be
--- dropped silently by the inner join in the dbt fact model, so the dimension
--- is topped up here per missing date (not guarded on the whole table, so it
--- also works on an existing installation).
+-- sql/02 seeds 2026-2027, but both API sources reach further back, and a date
+-- missing from dim_date is dropped silently by the inner join in the fact
+-- model -- the rows simply are not there, with no error anywhere.
+--
+-- How far back is set by the longer of the two: CoinGecko's free tier returns
+-- 365 days, but the Fear & Greed index goes back to its first publication on
+-- 2018-02-01. Measured on a real load: with the dimension starting in 2025,
+-- 2,522 of 3,205 index days were being discarded. assert_api_facts_cover_staging
+-- is what caught it.
+--
+-- 2018-2027 is 3,653 rows. A date dimension is cheap; losing history is not.
+-- The top-up runs per missing date rather than on an empty table, so it also
+-- extends an installation that is already seeded.
 -- ---------------------------------------------------------------------------
 ;WITH d AS (
-    SELECT CAST('2025-01-01' AS DATE) AS dt
+    SELECT CAST('2018-01-01' AS DATE) AS dt
     UNION ALL
     SELECT DATEADD(DAY, 1, dt) FROM d WHERE dt < '2027-12-31'
 )

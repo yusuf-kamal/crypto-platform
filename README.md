@@ -4,7 +4,7 @@
 
 An end-to-end data engineering project that ingests Binance historical trade data, processes it through a Bronze / Silver / Gold (medallion) lake, and serves 1-minute candles from a SQL Server star schema. Built as the Data Pill Data Engineering graduation project.
 
-> **Project status:** the batch path (ingestion → Silver → Gold → dbt) runs end to end on real data. Both source types, the streaming path, orchestrated dbt, observability, Delta Lake, the reporting views and CI are built; the streaming path and the dbt tests on the newer models have not yet been run against live data, and the dashboard is still open. See [Status](#2-status) for the per-area checklist, which says what is verified and what is only written.
+> **Project status:** the batch path (ingestion → Silver → Gold → dbt, including the constraints and the metrics table) has been run end to end on real data and is verified. Both source types, the streaming path, orchestrated dbt, observability, Delta Lake, the reporting views and CI are built; the streaming path and the dbt tests on the newer models have not yet been run against live data, and the dashboard is still open. See [Status](#2-status) for the per-area checklist, which says what is verified and what is only written.
 
 ---
 
@@ -28,13 +28,14 @@ The volatility view is also where the two sources meet: the candle fact gives th
 
 | Area | State |
 |---|---|
+| The batch path runs end to end on real data | Done. One symbol-month verified in 3 min 33 s; the full 25-file scope has not been run |
 | Batch ingestion from Binance public archive (5 symbols x 5 months = 25 files) | Done |
 | Second source type: CoinGecko API + Fear & Greed Index API (daily grain) | Done |
 | Streaming source (Binance WebSocket -> Kafka -> Spark Structured Streaming) | Code complete, not yet run against the live stream |
 | Data lake with Bronze / Silver / Gold buckets (S3-compatible) | Done |
 | Silver: Spark typing, cleaning, de-duplication, quarantine | Done |
 | Warehouse: SQL Server star schema, dbt incremental models | Done |
-| Data quality: 90 Python unit tests, 39 dbt tests | Done. The Python tests pass in CI; of the dbt tests, 13 are verified against real data and the remaining 26 (API facts, reporting views, ops) have been parsed but not yet run |
+| Data quality: 90 Python unit tests, 39 dbt tests | Done. The Python tests pass in CI, and all 39 dbt tests pass against real data (see [section 10](#10-performance-tuning-measured)) |
 | Orchestration: 7 Airflow DAGs, chained with Assets where they produce data | Done |
 | Airflow task that runs dbt (run, test, docs generate) | Done |
 | Gold recomputes only newly processed Silver files | Done |
@@ -49,7 +50,7 @@ The volatility view is also where the two sources meet: the candle fact gives th
 | Reporting views, one per business question, with their own grain and range tests | Done |
 | Power BI: model, measures and layout specified in `powerbi/` | Done |
 | Power BI: the .pbix itself, assembled in Desktop | Planned |
-| Delta Lake on the Silver layer (atomic writes, `replaceWhere`, time travel) | Code complete, not yet run |
+| Delta Lake on the Silver layer (atomic writes, `replaceWhere`, time travel) | Done, verified on a real run |
 | Iceberg, CDC, Terraform | Not started |
 
 ---
@@ -489,9 +490,46 @@ Stage timings of the final run: download + unzip 2.0 s, read + parse 24.7 s, qua
 | Gold staging build, 5 symbols x 5 months | 379.8 s |
 | `dbt run` (dim_symbol + fact_candles_1m, 1.1 M rows) | 27.3 s |
 | `dbt test` (13 tests) | 6.9 s |
-| Silver, 25 files, total wall-clock | `<TODO: from the Airflow run duration>` |
+| Silver, 25 files, total wall-clock | Not measured: the first end-to-end run used a one-file scope (below) |
 
 ---
+
+### First end-to-end run on Delta
+
+The run that this section had been waiting for. One file rather than the full
+scope, so the numbers above are not superseded -- they are a different
+workload on a different machine, and nothing here is a controlled comparison
+with them.
+
+**Workload:** `XRPUSDT` 2026-10, 4,740,009 trades, 0 rejected. Windows 11, 12
+logical CPUs, Docker Desktop limited to 7.6 GB, `SPARK_DRIVER_MEMORY=4g`,
+Silver written as Delta.
+
+| Stage | Seconds |
+|---|---|
+| Download + unzip from Bronze | 2.4 |
+| Read, parse, count | 39.6 |
+| Quarantine pass | 7.9 |
+| De-duplicate + count | 32.7 |
+| **Delta write** | **19.4** |
+| Silver total | **107.8** |
+| Gold: candles + JDBC to staging | 30.9 |
+| `dbt run`, 8 models | ~11 |
+| `dbt test`, 39 tests | ~9 |
+| Trigger to `dbt docs generate` finished | **3 min 33 s** |
+
+**What the run confirmed**, beyond the timings:
+
+- 44,640 fact rows, which is 31 days x 1,440 minutes x 1 symbol exactly.
+- 4,740,009 Silver rows, 0 rejected -- the same count this symbol-month has
+  in the exploration notebook, measured months apart on a different machine.
+- All 39 dbt tests pass against real data. 26 of them had only ever been
+  parsed before.
+- All 16 warehouse constraints exist after the dbt build: 6 primary keys, 6
+  foreign keys, 4 checks. This is what the one-owner-per-table change was
+  for, and it is the first proof that the hooks actually restore them.
+- `ops.vw_pipeline_health` returns `ok` for both layers with the row counts
+  and per-stage timings above, so the metrics path works end to end.
 
 ## 11. Challenges and how they were solved
 

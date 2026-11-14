@@ -53,6 +53,15 @@ def get_spark(app_name: str) -> SparkSession:
         # transaction log and does not use the output committer at all, which
         # is what makes its writes atomic.
         .config("spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version", "2")
+        # Spark's default heartbeat timeout is 10 seconds. On a resource-
+        # constrained host, a GC pause on a 20-30M row file routinely runs
+        # longer than that, so the driver misses its own heartbeat and kills
+        # the job with RpcTimeoutException -- not a sign the job is stuck,
+        # just that the default was tuned for a cluster with headroom to
+        # spare. Widened here rather than by throwing more memory at it,
+        # since the underlying cause is pause length, not heap size.
+        .config("spark.executor.heartbeatInterval", "60s")
+        .config("spark.network.timeout", "300s")
     )
 
     if LAKE_FORMAT == "delta":

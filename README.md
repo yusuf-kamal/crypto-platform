@@ -28,7 +28,7 @@ The volatility view is also where the two sources meet: the candle fact gives th
 
 | Area | State |
 |---|---|
-| The batch path runs end to end on real data | Done. One symbol-month verified in 3 min 33 s; the full 25-file scope has not been run |
+| The batch path runs end to end on real data, full scope | Done. All 25 files, 339,801,204 rows, 0 rejected, 1,101,600 fact rows |
 | Batch ingestion from Binance public archive (5 symbols x 5 months = 25 files) | Done |
 | Second source type: CoinGecko API + Fear & Greed Index API (daily grain) | Done, verified on a real run |
 | Streaming source (Binance WebSocket -> Kafka -> Spark Structured Streaming) | Done, verified against the live stream |
@@ -490,7 +490,8 @@ Stage timings of the final run: download + unzip 2.0 s, read + parse 24.7 s, qua
 | Gold staging build, 5 symbols x 5 months | 379.8 s |
 | `dbt run` (dim_symbol + fact_candles_1m, 1.1 M rows) | 27.3 s |
 | `dbt test` (13 tests) | 6.9 s |
-| Silver, 25 files, total wall-clock | Not measured: the first end-to-end run used a one-file scope (below) |
+| Silver, 25 files, total Spark compute time | **149.7 minutes** (sum of each file's own processing time) |
+| Silver, 25 files, calendar wall-clock | 13h 45m -- not a clean number; see "Full-scope run" below for why |
 
 ---
 
@@ -563,6 +564,51 @@ XRPUSDT  2026-11-14 08:29:00  0.98680   0.98740   0.98430   0.98560   222,473.6 
 
 On every row, `buy_volume + sell_volume` equals `volume` exactly -- the
 invariant the unit tests assert, now holding on live data.
+
+### Full-scope run (all 25 files)
+
+Triggered on 2026-11-14 at 09:26 UTC, finished 23:11 UTC. The gap between
+those two numbers and the 149.7-minute compute total above is the point of
+this section: two infrastructure limits showed up only at this scale, and
+each one stopped the run rather than slowing it down.
+
+**Result, once both were fixed:**
+
+| | |
+|---|---|
+| Silver rows | 339,801,204 across 25 files, **0 rejected** |
+| `fact_candles_1m` | **1,101,600** -- exactly 5 symbols x 153 days x 1,440 minutes |
+| Largest file | BTCUSDT 2026-06, 34,074,359 rows, 1,159 s |
+| Smallest file | XRPUSDT 2026-07, 2,644,553 rows, 151 s |
+| dbt | PASS=39 ERROR=0, same as the one-file run |
+
+**What actually happened, in order:**
+
+1. `SPARK_DRIVER_MEMORY=4g` (set for the one-file test) OOM'd on BTCUSDT
+   2026-06, the first and largest file. Raised the Docker Desktop memory
+   limit from 7.6 GB to 10 GB via `.wslconfig`, and the driver to 7g.
+2. With more memory but the same default config, four files (BTCUSDT
+   2026-08/09/10, ETHUSDT 2026-06) failed with
+   `RpcTimeoutException: Futures timed out after 10000 milliseconds` --
+   Spark's executor heartbeat, not a resource limit. A GC pause on a
+   20-30M row file routinely runs longer than the 10-second default, so the
+   driver missed its own heartbeat and Spark killed the task, reading as a
+   hang rather than as a timeout tuned for a cluster with headroom to
+   spare. Fixed once, for every job, in `src/common/spark.py`:
+   `spark.executor.heartbeatInterval=60s`, `spark.network.timeout=300s`.
+3. Lowered the driver back to 5g (7g had left too little margin for the
+   other containers) and retried the four failed files.
+4. While the last of those four (ETHUSDT 2026-06) was running, the Docker
+   Desktop engine itself stopped responding -- every `docker` command
+   returned `500 Internal Server Error`. A plain restart did not fix it;
+   only `wsl --shutdown` followed by a full Docker Desktop restart brought
+   the engine back. One file's Silver manifest was not yet written at that
+   point and had to be re-run; the other 24, and everything already in the
+   warehouse, were intact in their volumes across the crash.
+
+None of this is a data problem -- 0 rows were ever rejected, in either run.
+It is what the first attempt at this scale looks like, which is exactly
+what this section exists to record rather than smooth over.
 
 ## 11. Challenges and how they were solved
 

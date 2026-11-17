@@ -4,7 +4,6 @@ import tempfile
 import time
 import zipfile
 
-import boto3
 from pyspark import StorageLevel
 from pyspark.sql import functions as F
 
@@ -16,11 +15,16 @@ from src.common.lake import (
     write_lake,
 )
 from src.common.observability import json_log, write_run_metrics
+from src.common.data_quality import (
+    DataQualityError, record_failure, validate_summary,
+)
 from src.common.spark import get_spark
 from src.transform.silver_aggtrades import RAW_COLUMNS, parse_raw, tag_rejects
 
 
 def run(symbol: str, month: str) -> dict:
+    import boto3
+
     started = time.time()
     timings = {}
     key = f"binance/aggTrades/symbol={symbol}/{symbol}-aggTrades-{month}.zip"
@@ -50,8 +54,14 @@ def run(symbol: str, month: str) -> dict:
         raw = (
             spark.read.option("header", "false")
             .csv(f"file://{os.path.join(tmp, csv_name)}")
-            .toDF(*RAW_COLUMNS)
         )
+        if len(raw.columns) != len(RAW_COLUMNS):
+            exc = DataQualityError(f"aggtrades:{symbol}|{month}", [
+                f"expected {len(RAW_COLUMNS)} raw fields, got {len(raw.columns)}"])
+            record_failure(exc, lambda key, body: s3.put_object(
+                Bucket="silver", Key=key, Body=body), source_file=key)
+            raise exc
+        raw = raw.toDF(*RAW_COLUMNS)
         tagged = (
             tag_rejects(parse_raw(raw), month)
             .withColumn("symbol", F.lit(symbol))
@@ -85,23 +95,31 @@ def run(symbol: str, month: str) -> dict:
             .persist(StorageLevel.MEMORY_AND_DISK)
         )
         n_valid = valid.count()
+        # Count repeated parseable keys across rejected rows too: a malformed
+        # version of an existing trade must not hide behind the reject budget.
+        duplicate_groups = (
+            tagged.filter(F.col("agg_trade_id").isNotNull())
+            .groupBy("symbol", "agg_trade_id").count()
+            .filter(F.col("count") > 1)
+        )
+        n_duplicates = duplicate_groups.agg(
+            F.sum(F.col("count") - 1).alias("duplicates")).first()["duplicates"] or 0
         t = lap("dedupe_count_s", t)
         # repartition by trade_date keeps one output file per day instead of
         # the 200 tiny ones the default shuffle produced (section 10).
         # replaceWhere states the slice this file owns, so a re-run can only
         # ever replace its own symbol and days.
-        month_start, month_end = month_bounds(month)
-        write_lake(
-            valid.repartition(F.col("trade_date")),
-            SILVER_AGGTRADES,
-            partition_by=["symbol", "trade_date"],
-            replace_where=symbol_date_predicate(
-                symbol, month_start, month_end),
-        )
+        try:
+            publish_valid_trades(valid, symbol, month, total, n_rejected, n_valid,
+                                 n_duplicates=n_duplicates)
+        except DataQualityError as exc:
+            record_failure(exc, lambda diagnostic_key, body: s3.put_object(
+                Bucket="silver", Key=diagnostic_key, Body=body), source_file=key)
+            raise
+        finally:
+            tagged.unpersist()
+            valid.unpersist()
         lap("write_valid_s", t)
-
-        tagged.unpersist()
-        valid.unpersist()
 
     metrics = {
         "symbol": symbol, "month": month, "rows_in": total,
@@ -122,6 +140,24 @@ def run(symbol: str, month: str) -> dict:
         "details": {"timings": timings, "error_rate": metrics["error_rate"]},
     }])
     return metrics
+
+
+def publish_valid_trades(valid, symbol, month, total, n_rejected, n_valid,
+                         n_duplicates=None, expected_dates=()):
+    """Do not infer full-month coverage for sparse or partial historical data."""
+    start, end = month_bounds(month)
+    dates = {r["trade_date"] for r in valid.select("trade_date").distinct().collect()}
+    validate_summary(
+        f"aggtrades:{symbol}|{month}", rows_in=total, rows_valid=n_valid,
+        rows_rejected=n_rejected,
+        duplicates=(total - n_rejected - n_valid if n_duplicates is None else n_duplicates),
+        observed_symbols=[symbol] if n_valid and symbol else [], required_symbols=[symbol],
+        observed_dates=dates,
+        expected_dates=expected_dates,
+    )
+    write_lake(valid.repartition(F.col("trade_date")), SILVER_AGGTRADES,
+               partition_by=["symbol", "trade_date"],
+               replace_where=symbol_date_predicate(symbol, start, end))
 
 
 if __name__ == "__main__":

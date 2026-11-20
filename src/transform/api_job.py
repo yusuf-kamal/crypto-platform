@@ -1,7 +1,7 @@
 """Silver + staging for the REST API source.
 
 Reads the untouched JSON payloads from Bronze, parses them with the pure
-functions in api_daily.py, writes the valid rows to Silver as Parquet and to
+functions in api_daily.py, writes the valid rows to the configured lake format and to
 SQL Server staging, and parks the rejected rows in the quarantine prefix.
 
 Values arrive as JSON floats, so Spark keeps them as doubles here; the
@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import time
+from datetime import date
 
 from pyspark.sql.types import (
     DateType,
@@ -26,6 +27,7 @@ from pyspark.sql.types import (
 )
 
 from src.common.config import COINGECKO_IDS
+from src.common.data_quality import DataQualityError, record_failure
 from src.common.lake import (
     QUARANTINE_COIN_MARKET,
     QUARANTINE_FEAR_GREED,
@@ -39,6 +41,7 @@ from src.transform.api_daily import (
     fear_greed_rows,
     market_chart_rows,
     split_valid_rejected,
+    validate_api_batch,
 )
 
 BRONZE_BUCKET = "bronze"
@@ -144,7 +147,6 @@ def run(ds: str | None = None) -> dict:
     started = time.time()
     s3 = _s3()
     ds = (ds or "").strip() or latest_bronze_ds(s3)
-    spark = get_spark(f"api_daily_{ds}")
 
     market_rows: list[dict] = []
     for symbol, coin_id in COINGECKO_IDS.items():
@@ -158,28 +160,65 @@ def run(ds: str | None = None) -> dict:
     market_valid, market_rejected = split_valid_rejected(market_rows)
     fng_valid, fng_rejected = split_valid_rejected(fng_rows)
 
-    # These are daily aggregates: a few thousand rows, not millions. One
-    # partition per table keeps the object store free of tiny files.
-    for rows, schema, silver_path, staging in (
-        (market_valid, MARKET_SCHEMA, SILVER_COIN_MARKET, STAGING_MARKET),
-        (fng_valid, FNG_SCHEMA, SILVER_FEAR_GREED, STAGING_FNG),
-    ):
-        df = spark.createDataFrame(rows, schema).coalesce(1)
-        # The API returns its whole lookback window every run, so the
-        # dataset is replaced wholesale rather than sliced. In Delta that
-        # replacement is a single atomic commit.
-        write_lake(df, silver_path)
-        _write_staging(df.drop("source_ts_ms"), staging)
+    # Validate BOTH datasets before creating any publication writer. Raw Bronze
+    # remains replayable; immutable diagnostics also work for uncastable rows.
+    try:
+        through = date.fromisoformat(ds)
+        validate_api_batch("coin_market_daily", market_valid, market_rejected,
+                           symbols=tuple(COINGECKO_IDS), through=through)
+        validate_api_batch("fear_greed_daily", fng_valid, fng_rejected, through=through)
+    except DataQualityError as exc:
+        record_failure(exc, lambda key, body: s3.put_object(
+            Bucket="silver", Key=key, Body=body), ds=ds,
+            rejected_sample=repr((market_rejected + fng_rejected)[:10]))
+        raise
 
+    spark = get_spark(f"api_daily_{ds}")
+
+    # Quarantine can contain values that cannot fit the accepted Spark schema.
+    # Raw values remain replayable in Bronze; null unsafe quarantine cells.
     for rows, schema, path in (
         (market_rejected, MARKET_SCHEMA, QUARANTINE_COIN_MARKET),
         (fng_rejected, FNG_SCHEMA, QUARANTINE_FEAR_GREED),
     ):
         if rows:
-            write_lake(
-                spark.createDataFrame(rows, _with_reason(schema)).coalesce(1),
-                path,
-            )
+            safe_rows = []
+            for row in rows:
+                safe = dict(row)
+                for field in schema.fields:
+                    value = safe.get(field.name)
+                    if isinstance(field.dataType, DoubleType):
+                        try:
+                            safe[field.name] = (float(value)
+                                                if isinstance(value, (int, float)) else None)
+                        except OverflowError:
+                            safe[field.name] = None
+                    elif isinstance(field.dataType, (IntegerType, LongType)):
+                        bits = 32 if isinstance(field.dataType, IntegerType) else 64
+                        if not isinstance(value, int) or not -(2 ** (bits - 1)) <= value < 2 ** (bits - 1):
+                            safe[field.name] = None
+                safe_rows.append(safe)
+            write_lake(spark.createDataFrame(safe_rows, _with_reason(schema)).coalesce(1), path)
+
+    # Construct both accepted frames before the first overwrite, catching schema
+    # errors in the second dataset without publishing the first one.
+    market_valid = [{**r, **{k: float(r[k]) if r.get(k) is not None else None
+                           for k in ("price_usd", "market_cap_usd", "total_volume_usd")}}
+                    for r in market_valid]
+    frames = [spark.createDataFrame(rows, schema).coalesce(1) for rows, schema in (
+        (market_valid, MARKET_SCHEMA), (fng_valid, FNG_SCHEMA))]
+
+    # These are daily aggregates: a few thousand rows, not millions. One
+    # partition per table keeps the object store free of tiny files.
+    for df, silver_path, staging in (
+        (frames[0], SILVER_COIN_MARKET, STAGING_MARKET),
+        (frames[1], SILVER_FEAR_GREED, STAGING_FNG),
+    ):
+        # The API returns its whole lookback window every run, so the
+        # dataset is replaced wholesale rather than sliced. In Delta that
+        # replacement is a single atomic commit.
+        write_lake(df, silver_path)
+        _write_staging(df.drop("source_ts_ms"), staging)
 
     metrics = {
         "ds": ds,

@@ -49,3 +49,19 @@ REJECT_CASES = [
 @pytest.mark.parametrize("name,row,expected", REJECT_CASES)
 def test_bad_rows_get_a_reject_reason(spark, name, row, expected):
     assert run(spark, [row]).collect()[0].reject_reason == expected
+
+
+@pytest.mark.parametrize("column,value", [
+    ("first_trade_id", "bad"), ("last_trade_id", "bad"),
+    ("is_best_match", "maybe"), ("price", "NaN"),
+    ("price", "Infinity"), ("quantity", "-Infinity"),
+    ("transact_time", "bad"),
+])
+def test_required_and_non_finite_fields_are_quarantined(spark, column, value):
+    row = list(GOOD)
+    row[RAW_COLUMNS.index(column)] = value
+    assert run(spark, [tuple(row)]).collect()[0].reject_reason == "null_or_unparseable_field"
+
+
+def test_negative_trade_ids_are_quarantined(spark):
+    assert run(spark, [("-1",) + GOOD[1:]]).collect()[0].reject_reason == "negative_trade_id"

@@ -42,11 +42,15 @@ def tag_rejects(df: DataFrame, expected_month: str) -> DataFrame:
         F.when(
             F.col("agg_trade_id").isNull() | F.col("price").isNull()
             | F.col("quantity").isNull() | F.col("trade_ts").isNull()
+            | F.col("first_trade_id").isNull() | F.col("last_trade_id").isNull()
+            | F.col("is_best_match").isNull()
             | F.col("is_buyer_maker").isNull(),
             "null_or_unparseable_field",
         )
         .when((F.col("price") <= 0) | (F.col("quantity") <= 0),
               "non_positive_price_or_quantity")
+        .when((F.col("agg_trade_id") < 0) | (F.col("first_trade_id") < 0)
+              | (F.col("last_trade_id") < 0), "negative_trade_id")
         .when(F.col("last_trade_id") < F.col("first_trade_id"),
               "invalid_trade_id_range")
         .when(F.date_format("trade_ts", "yyyy-MM") != F.lit(expected_month),

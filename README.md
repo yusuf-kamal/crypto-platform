@@ -4,7 +4,7 @@
 
 An end-to-end data engineering project that ingests Binance historical trade data, processes it through a Bronze / Silver / Gold (medallion) lake, and serves 1-minute candles from a SQL Server star schema. Built as the Data Pill Data Engineering graduation project.
 
-> **Project status:** the batch path (ingestion → Silver → Gold → dbt, including the constraints and the metrics table) has been run end to end on real data and is verified. Both source types, the streaming path, orchestrated dbt, observability, Delta Lake, the reporting views and CI are built; the streaming path and the dbt tests on the newer models have not yet been run against live data, and the dashboard is still open. See [Status](#2-status) for the per-area checklist, which says what is verified and what is only written.
+> **Project status:** every layer has been run on real data and verified: the batch path end to end (25 files, 339.8 M Silver rows, 1.1 M fact rows), the API source, the live streaming path, Delta Lake on Silver, the pre-publication data quality gate, orchestrated dbt (39 tests) and the Power BI dashboard. See [Status](#2-status) for the per-area checklist.
 
 ---
 
@@ -34,8 +34,9 @@ The volatility view is also where the two sources meet: the candle fact gives th
 | Streaming source (Binance WebSocket -> Kafka -> Spark Structured Streaming) | Done, verified against the live stream |
 | Data lake with Bronze / Silver / Gold buckets (S3-compatible) | Done |
 | Silver: Spark typing, cleaning, de-duplication, quarantine | Done |
+| Pre-publication data quality gate: a Silver slice is only published if it passes (`src/common/data_quality.py`) | Done, covered by unit tests |
 | Warehouse: SQL Server star schema, dbt incremental models | Done |
-| Data quality: 90 Python unit tests, 39 dbt tests | Done. The Python tests pass in CI, and all 39 dbt tests pass against real data (see [section 10](#10-performance-tuning-measured)) |
+| Data quality: 139 Python unit tests (41 on the quality gate), 39 dbt tests | Done. The Python tests pass in CI, and all 39 dbt tests pass against real data (see [section 10](#10-performance-tuning-measured)) |
 | Orchestration: 7 Airflow DAGs, chained with Assets where they produce data | Done |
 | Airflow task that runs dbt (run, test, docs generate) | Done |
 | Gold recomputes only newly processed Silver files | Done |
@@ -49,9 +50,9 @@ The volatility view is also where the two sources meet: the candle fact gives th
 | Warehouse keys and checks survive a dbt `--full-refresh` | Done |
 | Reporting views, one per business question, with their own grain and range tests | Done |
 | Power BI: model, measures and layout specified in `powerbi/` | Done |
-| Power BI: the .pbix itself, assembled in Desktop | Planned |
+| Power BI: the .pbix itself (`powerbi/Crypto Market Dashboard.pbix`) | Done |
 | Delta Lake on the Silver layer (atomic writes, `replaceWhere`, time travel) | Done, verified on a real run |
-| Iceberg, CDC, Terraform | Not started |
+| Iceberg, CDC, Terraform |  the Lakehouse requirement is already met by Delta Lake, and streaming is built too |
 
 ---
 
@@ -75,7 +76,7 @@ flowchart LR
     S[Binance WebSocket<br/>live trades] -->|trade-producer| T[(Kafka<br/>binance.trades)]
     T -->|Structured Streaming| U[trade-consumer<br/>1-minute windows]
     U --> V[(Silver<br/>stream_candles_1m)]
-    G -.->|planned| H[Power BI]
+    G --> H[Power BI dashboard]
 ```
 
 **Key idea:** every individual trade stays in the lake (Silver). The warehouse holds one row per symbol per minute, about 1/400 of the trade count, which keeps SQL Server and BI queries fast without losing any detail.
@@ -87,6 +88,9 @@ erDiagram
     DIM_SYMBOL ||--o{ FACT_CANDLES_1M : symbol_key
     DIM_DATE   ||--o{ FACT_CANDLES_1M : date_key
     DIM_TIME   ||--o{ FACT_CANDLES_1M : time_key
+    DIM_SYMBOL ||--o{ FACT_COIN_MARKET_DAILY : symbol_key
+    DIM_DATE   ||--o{ FACT_COIN_MARKET_DAILY : date_key
+    DIM_DATE   ||--o| FACT_FEAR_GREED_DAILY : date_key
 
     DIM_SYMBOL {
         int symbol_key PK
@@ -123,9 +127,21 @@ erDiagram
         decimal sell_volume
         datetime2 loaded_at
     }
+    FACT_COIN_MARKET_DAILY {
+        int date_key FK
+        int symbol_key FK
+        decimal price_usd
+        decimal market_cap_usd
+        decimal total_volume_usd
+    }
+    FACT_FEAR_GREED_DAILY {
+        int date_key FK
+        smallint fng_value
+        varchar fng_classification
+    }
 ```
 
-**Grain:** one row = one symbol in one minute. All timestamps are **UTC** (as delivered by Binance).
+**Grain:** `fact_candles_1m` is one symbol in one minute. `fact_coin_market_daily` is one coin in one day, `fact_fear_greed_daily` is one market-wide value per day. All timestamps are **UTC** (as delivered by Binance).
 
 ---
 
@@ -183,6 +199,7 @@ Fill in `.env` (never commit it). The file lists every variable with a comment; 
 | `ALERT_WEBHOOK_URL` | Optional. Empty means failures are logged but not pushed anywhere |
 | `LAKE_FORMAT` | `delta` by default. Set it to `parquet` to fall back to the pre-Delta behaviour without touching a job |
 | `SPARK_DRIVER_MEMORY` | `6g` by default. Must fit inside the Docker memory limit |
+| `DQ_MAX_REJECTION_RATE` | `0.01` by default. The quality gate refuses to publish a Silver slice when more than this share of its rows was rejected. Must be between 0 and 1 |
 | `MSSQL_PLATFORM` | `linux/amd64`. Only change it if Microsoft ever ships an arm64 build |
 
 Generate each Airflow secret with:
@@ -212,9 +229,9 @@ The `mssql-init` service then waits for SQL Server and applies every script in `
 ```text
 sql/01_create_gold.sql        database, gold schema, dim_date, dim_time, fact
 sql/01b_create_login.sql      the crypto_app login, before anything grants to it
-sql/02_seed_dims.sql          dim_date (2025-2027) and dim_time (1,440 rows)
+sql/02_seed_dims.sql          dim_date and dim_time (1,440 rows)
 sql/03_create_staging.sql     staging.candles_1m
-sql/04_create_api_staging.sql API staging tables + dim_date top-up for 2025
+sql/04_create_api_staging.sql API staging tables, dim_date history back to 2018
 sql/05_create_ops.sql         ops.pipeline_runs (run metrics)
 ```
 
@@ -226,7 +243,7 @@ Every script is idempotent, so re-running the service changes nothing. The Airfl
 
 **3. Run the batch pipeline**
 
-Trigger `binance_batch_ingestion` in the Airflow UI. When it finishes, `binance_silver` starts automatically (Asset), then `binance_gold`, then `dbt_build` (`dbt run`, `dbt test`, `dbt docs generate`).
+The DAGs are created unpaused (`AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=false` in `docker-compose.yml`), so nothing needs enabling by hand. Trigger `binance_batch_ingestion` in the Airflow UI. When it finishes, `binance_silver` starts automatically (Asset), then `binance_gold`, then `dbt_build` (`dbt run`, `dbt test`, `dbt docs generate`).
 
 `binance_gold` is incremental: it only turns Silver files into candles that it has not processed before. To recompute the whole scope, trigger it with the config `{"full_refresh": true}`.
 
@@ -274,6 +291,10 @@ ORDER  BY layer, entity;
 
 **Connecting a BI tool.** Point it at `localhost,14330`, database `CryptoDWH`, login `crypto_app`, and use the three `gold.vw_*` views rather than the fact tables: they already carry the business logic for the questions in section 1, and they are covered by dbt tests.
 
+**Dashboard.** The finished Power BI report is `powerbi/Crypto Market Dashboard.pbix`; its model, DAX measures and design notes sit next to it.
+
+![Dashboard](powerbi/dashboard-full.png)
+
 The compose `dbt` service bind-mounts `./dbt`, so `docs generate` through it writes `dbt/target/` on the host, which `dbt docs serve` can then open. The Airflow DAG runs the same image with the project baked in and keeps its artefacts in the `dbt_target` volume.
 
 ---
@@ -296,6 +317,7 @@ src/
     spark.py                   Spark session factory (S3A, JDBC, Kafka, Delta)
     lake.py                    lake paths, format, replaceWhere, maintenance
     observability.py           structured logging, run metrics, failure alerts
+    data_quality.py            pre-publication gate: contracts that block a bad publish
   ingestion/
     api_sources.py             HTTP access to both public REST APIs
   transform/
@@ -312,8 +334,7 @@ src/
     trades_stream_job.py       Structured Streaming: Kafka -> Silver
 dbt/
   models/                      dim_symbol, 3 facts, 3 reporting views, ops health view
-  macros/                      constraints as hooks, literal custom schemas
-  macros/                      key / foreign key / check constraints as hooks
+  macros/                      key / foreign key / check constraints as hooks, literal custom schemas
   tests/                       singular data tests
 sql/                           DDL, dimension seeds, login, ops table
 docker/
@@ -321,11 +342,12 @@ docker/
   dbt/                         dbt image with the project baked in (ODBC)
   mssql/init.sh                applies sql/ once SQL Server is up
   streaming/                   small image for the WebSocket producer
-powerbi/                       model, DAX measures and the dashboard design
+powerbi/                       model, DAX measures, dashboard design, the .pbix and screenshots
 scripts/prefetch.sh            pulls images and builds, with retries, before the first start
 tests/                         PySpark + plain Python unit tests
 notebooks/                     exploration (outputs kept: they are the row counts quoted in section 4)
 docker-compose.yml
+DATA_QUALITY_GATE.md            how the pre-publication gate works and what it covers
 pyproject.toml                 ruff + pytest configuration
 .dockerignore                  keeps .git and notebooks out of the build context
 .github/workflows/ci.yml       CI: lint, tests, DAG import, compose, dbt parse
@@ -369,6 +391,8 @@ Compose services, always on: SQL Server + its init job, object storage + bucket 
 | **Metrics written by the jobs, not by Airflow** | The job is the only place that knows row counts and per-stage timings; Airflow only knows that a task ended | Parsing task logs, a separate collector |
 | **Reporting views, not materialised tables** | The fact is 1.1 M rows and a BI tool aggregates that in well under a second. A materialised copy would be one more object that can go stale, and the view definitions are the tested business logic | Materialised aggregate tables, logic inside the dashboard |
 | **One owner per table: dbt owns the facts and dim_symbol, SQL owns the seeded dimensions** | A table created by a DDL script and then materialized by dbt loses its constraints on the first `--full-refresh`, silently. Keys and checks are dbt hooks now, so they are restored after every build | DDL-only tables with dbt as a view layer, dbt contracts |
+| **A gate in front of every Silver overwrite, not just a quarantine** | Quarantine records bad rows but still publishes the rest. A file where 20% of the rows are bad is a broken file, not 80% good data, so the job stops before it replaces accepted data and the previous slice stays intact | Publish and alert afterwards, quarantine only |
+| **Gate limits read at task runtime, not at DAG parse time** | The DAG file is parsed constantly by the scheduler; a bad `DQ_MAX_REJECTION_RATE` should fail the task that uses it, not break every DAG | A constant in the DAG file |
 
 ---
 
@@ -381,10 +405,11 @@ Compose services, always on: SQL Server + its init job, object storage + bucket 
 - Derived columns: `side` (BUY / SELL from `is_buyer_maker`), `quote_value = price x quantity`, `trade_date`.
 - **Quarantine:** rows are rejected, with a `reject_reason`, when a required field is null or unparseable, price or quantity is not positive, the trade-id range is invalid, or the trade falls outside the file's month. Invalid rows never fail the job. On the real data so far, **0 rows were rejected** (rules are verified by unit tests).
 - De-duplication on `(symbol, agg_trade_id)`. The id is unique per symbol, not globally: one job handles one symbol, so de-duplicating on the id alone happened to be correct, but it would have silently deleted real trades the moment a job covered two symbols.
+- **Pre-publication gate.** Quarantine is diagnostic output, not publication, so before anything is written the job passes bounded counts to `validate_summary()`. The slice is refused, and the task fails, when: the input is empty, no row is valid, any duplicate business key is found, a required symbol or expected date is missing, or the rejection rate exceeds `DQ_MAX_REJECTION_RATE` (1% by default). The raw column count is checked against the expected layout first. A failure raises `DataQualityError` *before* the Delta write, so the previous Silver slice is untouched, and `record_failure()` logs a structured `data_quality_failed` event and writes a JSON report to `_quarantine/_quality_failures/`. See `DATA_QUALITY_GATE.md`.
 - The write is a single Delta commit scoped with `replaceWhere` to this file's symbol and days, so a re-run can only ever replace its own slice, and a reader never sees a partial write. The quarantine rule that rejects out-of-month trades is what guarantees the written rows satisfy that predicate.
 - A per-file manifest (row counts, rejected count, error rate, per-stage timings) is written after each successful run.
 
-### Gold (dbt): 33 tests
+### Gold (dbt): 39 tests
 
 - `unique` and `not_null` on keys, `not_null` on `trade_count`.
 - `relationships` (referential integrity) from the fact to `dim_symbol`, `dim_date` and `dim_time`.
@@ -419,13 +444,13 @@ Two details make this work on a repeat run. The `not null` step is guarded by `s
 | `missing_fng_classification` | Fear & Greed | The label is what the dashboard groups by |
 
   A missing `market_cap_usd` or `total_volume_usd` is deliberately **not** a reject: CoinGecko omits them now and then, and dropping the row would throw away that day's valid price too. Those columns carry nulls into the fact instead.
-- `dim_date` is topped up back to 2025 by `sql/04`, because the fact models join it with an inner join and a missing day would otherwise vanish without an error. `assert_api_facts_cover_staging` fails if that ever happens.
+- `dim_date` covers 2018-2027 (the Fear & Greed index starts on 2018-02-01), because the fact models join it with an inner join and a missing day would otherwise vanish without an error. `assert_api_facts_cover_staging` fails if that ever happens.
 
 ### Streaming (Spark Structured Streaming)
 
 - The same typing and `side` rules as the batch Silver layer, so a streamed candle and a batch candle are comparable.
 - There is no quarantine: a stream has no file to replay, and failing an unbounded query over one malformed message would lose live data. `from_json` turns an unparseable message into nulls and `valid_trades()` drops it; the counts show up in the query's progress metrics.
-- The **watermark** (2 minutes by default) is what bounds the state: Spark closes a minute and forgets it once no trade that could still belong to it can arrive. Append mode then writes that candle exactly once, so a published Parquet file is never rewritten.
+- The **watermark** (2 minutes by default) is what bounds the state: Spark closes a minute and forgets it once no trade that could still belong to it can arrive. Append mode then writes that candle exactly once, so a published candle is never rewritten.
 - The checkpoint holds the Kafka offsets and the open window state, which is what makes a restart pick up where it stopped instead of double-counting.
 
 ### Observability
@@ -434,6 +459,16 @@ Two details make this work on a repeat run. The `not null` step is guarded by `s
 - Each job also appends a row per processed entity to `ops.pipeline_runs` (layer, entity, status, row counts, seconds, the job's own metrics as JSON). A metrics write that fails is logged and swallowed: observability must never fail the pipeline.
 - Every DAG carries an `on_failure_callback` that logs the failure as a structured event and, if `ALERT_WEBHOOK_URL` is set, posts a short message to it. A webhook that cannot be reached must not mask the real error, so that failure is logged too.
 - `ops.vw_pipeline_health` reads that table back: one row per (layer, entity) with its last run, its own history for comparison, and a `health` verdict -- `ok`, `quality` (the last run rejected more than 1% of its input), `stale` (nothing for over 48 hours) or `attention` (the last run did not end in `processed`). Checked in that order, so a failure is never hidden behind a reject rate.
+
+### Schema evolution
+
+| What changes | What happens |
+|---|---|
+| Binance adds or drops a column in `aggTrades` | The gate compares the raw column count with the expected layout and stops publication. Nothing is misparsed into the wrong columns; the raw zip is still in Bronze |
+| Binance changes the timestamp unit (milliseconds to microseconds, which the 2026 files already did) | The unit is detected from the digit count, so old and new files both load. Covered by a unit test |
+| An API adds a field | Ignored: the raw JSON stays untouched in Bronze and only the fields the parser names are read. A field that disappears or becomes unparseable turns into `None` and is handled by the reject rules |
+| A column has to be added to the warehouse | Change the pure transform and its test, add the column to staging in `sql/`, add it to the dbt model, reprocess the affected slice from Bronze (`replaceWhere` replaces only that slice), then `dbt run --full-refresh` on the model. The constraints are restored by the dbt hooks |
+| Delta receives data that does not match the table schema | Delta enforces the table schema on write by default, so an unexpected column fails the write instead of being appended silently |
 
 ### Re-running safely
 
@@ -451,7 +486,8 @@ Two details make this work on a repeat run. The `not null` step is guarded by `s
 
 ## 9. Known limitations
 
-- The streaming path is **code complete but has not been run against the live Binance stream**, so its numbers and failure modes are untested. The same holds for the dbt tests on the two API facts.
+- The streaming path was verified on the live Binance stream for a short window (eight closed 1-minute candles, section 10), not in a long soak test. Behaviour over hours or days -- consumer restarts, WebSocket reconnects, state growth -- is not measured.
+- The quality gate is strict on purpose: any duplicate business key or missing required symbol or date blocks publication. A source that legitimately contains duplicates would need that rule relaxed in `validate_summary()`.
 - The whole platform is still single-node: Spark runs `local[4]`, Kafka is one broker with replication factor 1, and SQL Server is one container. Nothing here survives a machine failure.
 - `dbt_build` reaches the Docker daemon through the mounted socket. That gives the Airflow containers full control of the host's Docker, which is fine for a single-user local setup and would not be acceptable anywhere else.
 - `trustServerCertificate=true` / `trust_cert: true` is used for SQL Server's self-signed certificate. Do not use it in production.
@@ -489,9 +525,23 @@ Stage timings of the final run: download + unzip 2.0 s, read + parse 24.7 s, qua
 | Bronze ingestion, 30 files, 2 concurrent downloads (earlier scope, before the final 25-file scope) | 32 min 6 s (download-bound at about 2.7 to 2.9 MB/s) |
 | Gold staging build, 5 symbols x 5 months | 379.8 s |
 | `dbt run` (dim_symbol + fact_candles_1m, 1.1 M rows) | 27.3 s |
-| `dbt test` (13 tests) | 6.9 s |
-| Silver, 25 files, total Spark compute time | **149.7 minutes** (sum of each file's own processing time) |
+| `dbt test` (13 tests, before the API facts and reporting views existed) | 6.9 s |
+| Silver, 25 files, total Spark compute time | **120.1 minutes** (sum of each file's last successful run in `ops.pipeline_runs`) |
 | Silver, 25 files, calendar wall-clock | 13h 45m -- not a clean number; see "Full-scope run" below for why |
+
+The 120.1 minutes comes from the latest run of each file:
+
+```sql
+WITH latest AS (
+  SELECT entity, rows_in, rows_valid, rows_rejected, seconds,
+         ROW_NUMBER() OVER (PARTITION BY entity ORDER BY run_pk DESC) AS rn
+  FROM   ops.pipeline_runs
+  WHERE  layer = 'silver'
+)
+SELECT COUNT(*) AS files, SUM(rows_in) AS rows_in, SUM(rows_rejected) AS rejected,
+       SUM(seconds) / 60.0 AS total_min
+FROM   latest WHERE rn = 1;   -- 25 files, 339,801,204 rows, 0 rejected, 120.14
+```
 
 ---
 
@@ -568,7 +618,7 @@ invariant the unit tests assert, now holding on live data.
 ### Full-scope run (all 25 files)
 
 Triggered on 2026-11-14 at 09:26 UTC, finished 23:11 UTC. The gap between
-those two numbers and the 149.7-minute compute total above is the point of
+those two numbers and the 120.1-minute compute total above is the point of
 this section: two infrastructure limits showed up only at this scale, and
 each one stopped the run rather than slowing it down.
 
@@ -578,8 +628,8 @@ each one stopped the run rather than slowing it down.
 |---|---|
 | Silver rows | 339,801,204 across 25 files, **0 rejected** |
 | `fact_candles_1m` | **1,101,600** -- exactly 5 symbols x 153 days x 1,440 minutes |
-| Largest file | BTCUSDT 2026-06, 34,074,359 rows, 1,159 s |
-| Smallest file | XRPUSDT 2026-07, 2,644,553 rows, 151 s |
+| Largest file | BTCUSDT 2026-06, 34,074,359 rows, 570 s (last run) |
+| Smallest file | XRPUSDT 2026-07, 2,644,553 rows, 98 s (last run) |
 | dbt | PASS=39 ERROR=0, same as the one-file run |
 
 **What actually happened, in order:**
@@ -620,7 +670,7 @@ what this section exists to record rather than smooth over.
 | Silver writes very slow (6,000+ tiny files per month) | Diagnosed with per-stage timings, then committer v2 and repartition (section 10) |
 | SQL Server error 8645 (timeout waiting for memory) during `dbt run` | Host RAM was exhausted by the WSL VM; freed memory by shutting down WSL, added an index on the staging table |
 | `UndefinedError: 'ds' is undefined` on the API warehouse DAG | It is Asset-triggered, and an Asset-triggered run has no data interval -- so `{{ ds }}` is not empty there, it does not exist, and rendering it fails the task before it starts. The sibling DAG uses the same line and works, because it runs on a schedule. The day is now resolved from what Bronze actually holds |
-| 2,522 of 3,205 Fear & Greed days vanished into nothing | `dim_date` started in 2025; the index goes back to 2018-02-01. The fact model joins the dimension with an inner join, so those days were dropped with no error anywhere -- the table would simply have been a fifth of its proper size. `assert_api_facts_cover_staging`, written for exactly this, failed the build. dim_date now covers 2018-2027, which is 3,653 rows |
+| 2,522 of 3,205 Fear & Greed days vanished into nothing | `dim_date` started in 2025; the index goes back to 2018-02-01. The fact model joins the dimension with an inner join, so those days were dropped with no error anywhere -- the table would simply have been a fifth of its proper size. `assert_api_facts_cover_staging`, written for exactly this, failed the build. dim_date now covers 2018-2027, which is 3,652 rows |
 | The first real build died at the last layer with `exit code: 18` | curl's CURLE_PARTIAL_FILE: a dropped connection mid-download. `curl -fsSLO` does not retry a truncated transfer, so one interruption anywhere in 280 MB discarded the whole Airflow image -- ten and a half minutes of build, surfaced only as a BuildKit wall of text ending in a bare exit code. The jar URLs were all correct; it was transport, not coordinates. Fixed with `--retry-all-errors --continue-at -` plus a prefetch script |
 | Every streaming test failed with `AMBIGUOUS_REFERENCE: t` | Binance names the trade id `t` and the trade time `T`, and Spark resolves names case-insensitively, so a `from_json` struct holding both fields makes every reference to either one fail. Parsing with `get_json_object`, whose JSON paths are case-sensitive, fixes it without turning on `spark.sql.caseSensitive` session-wide |
 | dbt silently dropped the star schema's keys | sql/01 created `dim_symbol` and `fact_candles_1m`, but dbt materializes the same names: the first `--full-refresh` replaced them with constraint-free tables. The DDL now stops at the seeded dimensions and every key, foreign key and check is a dbt hook |
